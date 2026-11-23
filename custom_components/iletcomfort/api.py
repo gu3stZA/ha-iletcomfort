@@ -538,6 +538,9 @@ class ILetComfortClient:
         self._api_base = api_base.rstrip("/")
         self._access_token = access_token
         self._timeout = timeout
+        # Optional LAN transport (see local.py). When set, send_hex_command
+        # bypasses the cloud; login/list_appliances still use the cloud.
+        self.local_transport: Any = None
         self._session = requests.Session()
         self._session.headers.update({
             "Content-Type": "application/json",
@@ -707,7 +710,14 @@ class ILetComfortClient:
     def send_hex_command(
         self, appliance_code: str, command_hex: str,
     ) -> str:
-        """Send a raw hex command to an appliance and return the response hex."""
+        """Send a raw hex command to an appliance and return the response hex.
+
+        With a local transport attached (LAN mode) the frame goes straight to
+        the heat pump instead of through the cloud; the reply frame format is
+        the same, so callers are unaffected.
+        """
+        if self.local_transport is not None:
+            return self.local_transport.send_hex_command(command_hex)
         result = self._v2_request(
             "/midea/open/business/v1/appliance/control/hexadecimal",
             {

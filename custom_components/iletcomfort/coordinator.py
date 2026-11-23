@@ -30,10 +30,18 @@ from .api import (
 )
 from .const import (
     CONF_APPLIANCE_CODE,
+    CONF_CONNECTION_MODE,
     CONF_ENABLE_MQTT_PUSH,
+    CONF_LOCAL_HOST,
+    CONF_LOCAL_KEY,
+    CONF_LOCAL_TOKEN,
     CONF_OPERATION_MODE,
     CONF_REGION,
+    CONF_SN8,
+    CONNECTION_MODE_LOCAL,
+    DEFAULT_CONNECTION_MODE,
     DEFAULT_ENABLE_MQTT_PUSH,
+    LOCAL_PORT,
     DEFAULT_OPERATION_MODE,
     DEFAULT_REGION,
     DEFAULT_SCAN_INTERVAL,
@@ -47,6 +55,7 @@ from .model_profiles import (
     apply_profile_to_status,
     resolve_profile,
 )
+from .local import LocalTransport
 from .mqtt import ILetComfortPushClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -80,6 +89,9 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
         )
         self.entry = entry
+        # Options this coordinator was built from; the update listener reloads
+        # only when these change (not on data-only updates like sn8 persist).
+        self.loaded_options: dict[str, Any] = dict(entry.options)
         region = entry.data.get(CONF_REGION, DEFAULT_REGION)
         api_base = REGION_URLS.get(region, REGION_URLS[DEFAULT_REGION])
         self.client = ILetComfortClient(api_base=api_base)
@@ -95,7 +107,27 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else DEFAULT_OPERATION_MODE
             )
         self._operation_mode: str = operation_mode
-        self._push_enabled = operation_mode == OPERATION_MODE_PHONE_APP
+        # Local (LAN) mode: C3 frames go straight to the heat pump. No account
+        # polling happens, so there is no login war with the phone app and
+        # neither MQTT push nor the phone-app write lock applies.
+        self.local_transport: LocalTransport | None = None
+        if (
+            entry.options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+            == CONNECTION_MODE_LOCAL
+        ):
+            self.local_transport = LocalTransport(
+                hass.loop,
+                entry.options[CONF_LOCAL_HOST],
+                LOCAL_PORT,
+                int(self.appliance_code),
+                entry.options[CONF_LOCAL_TOKEN],
+                entry.options[CONF_LOCAL_KEY],
+            )
+            self.client.local_transport = self.local_transport
+        self._push_enabled = (
+            operation_mode == OPERATION_MODE_PHONE_APP
+            and self.local_transport is None
+        )
         self._push_client: ILetComfortPushClient | None = None
         # Cloud metadata for this appliance (applianceType, modelNumber, sn8, …),
         # cached for model selection and diagnostics. Failed/incomplete lookups
@@ -132,12 +164,20 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Read from the cached cloud metadata (``appliance_meta``); it selects the
         model decode profile (issue #22 / #12). None when metadata is absent,
-        which resolves to the STANDARD profile.
+        which resolves to the STANDARD profile. Falls back to the sn8 persisted
+        in entry data, so local mode keeps its profile without the cloud.
         """
-        if self.appliance_meta is None:
-            return None
-        sn8 = self.appliance_meta.get("sn8")
-        return str(sn8) if sn8 else None
+        if self.appliance_meta is not None:
+            sn8 = self.appliance_meta.get("sn8")
+            if sn8:
+                return str(sn8)
+        persisted = self.entry.data.get(CONF_SN8)
+        return str(persisted) if persisted else None
+
+    @property
+    def is_local(self) -> bool:
+        """Return True when C3 frames go over the LAN instead of the cloud."""
+        return self.local_transport is not None
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch status and sensors from the heat pump."""
@@ -373,7 +413,10 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         used for both decoding and control. A failed lookup is retried on the
         next poll; it is logged at DEBUG and leaves ``appliance_meta`` as None.
         """
-        if self.sn8 is not None:
+        if self.appliance_meta is not None and self.appliance_meta.get("sn8"):
+            return
+        if self.is_local and self.entry.data.get(CONF_SN8):
+            # Don't hit the cloud every poll in local mode once sn8 is known.
             return
         try:
             appliances = await self.hass.async_add_executor_job(
@@ -384,18 +427,40 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for appliance in appliances:
                 if str(appliance.get("applianceCode", "")) == str(self.appliance_code):
                     self.appliance_meta = appliance
+                    self._persist_sn8(appliance.get("sn8"))
                     return
         except Exception as err:  # noqa: BLE001 — retry on the next poll
             _LOGGER.debug("Could not fetch appliance metadata: %s", err)
 
+    def _persist_sn8(self, sn8: Any) -> None:
+        """Store the discovered sn8 in entry data (used offline by local mode)."""
+        if sn8 and self.entry.data.get(CONF_SN8) != str(sn8):
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, CONF_SN8: str(sn8)},
+            )
+
     async def async_first_refresh_with_login(self) -> None:
-        """Login first, then do the initial data refresh."""
-        # Try loading saved token first
-        token_loaded = await self.hass.async_add_executor_job(
-            self.client.load_token, self._token_file,
-        )
-        if not token_loaded:
-            await self._async_login()
+        """Login first, then do the initial data refresh.
+
+        In local mode the cloud is only needed to discover sn8, so a cloud
+        outage must not stop the integration from starting.
+        """
+        try:
+            # Try loading saved token first
+            token_loaded = await self.hass.async_add_executor_job(
+                self.client.load_token, self._token_file,
+            )
+            if not token_loaded:
+                await self._async_login()
+        except Exception as err:
+            if not self.is_local:
+                raise
+            _LOGGER.warning(
+                "Cloud login failed in local mode; continuing over LAN "
+                "(model code from saved data: %s): %s",
+                self.sn8 or "unknown",
+                err,
+            )
 
         await self._ensure_appliance_meta()
 
@@ -410,7 +475,7 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         encoding per model (e.g. the KJRH-120L's short commands vs the legacy
         C3 SET frame); see ``model_profiles`` and ``ILetComfortClient.set_device``.
         """
-        if self._operation_mode == OPERATION_MODE_PHONE_APP:
+        if self._operation_mode == OPERATION_MODE_PHONE_APP and not self.is_local:
             raise HomeAssistantError(
                 "Control is disabled in phone app coexistence mode; "
                 "switch to HA primary mode to send commands"
@@ -485,6 +550,11 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return await self.hass.async_add_executor_job(
                 self.client.create_app_cert
             )
+
+    async def async_close_local(self) -> None:
+        """Close the LAN connection, if any (entry unload)."""
+        if self.local_transport is not None:
+            await self.local_transport.async_close()
 
     async def async_stop_push(self) -> None:
         """Stop the MQTT push listener, if running."""

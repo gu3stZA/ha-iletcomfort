@@ -441,7 +441,10 @@ async def test_options_flow_selects_phone_app_mode(hass: HomeAssistant):
         user_input={CONF_OPERATION_MODE: OPERATION_MODE_PHONE_APP},
     )
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
-    assert entry.options == {CONF_OPERATION_MODE: OPERATION_MODE_PHONE_APP}
+    assert entry.options == {
+        CONF_OPERATION_MODE: OPERATION_MODE_PHONE_APP,
+        "connection_mode": "cloud",
+    }
 
 
 async def test_legacy_push_option_defaults_to_phone_app_mode(

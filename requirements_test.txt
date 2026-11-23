@@ -1,1 +1,2 @@
 pytest-homeassistant-custom-component
+msmart-ng>=2025.1.0

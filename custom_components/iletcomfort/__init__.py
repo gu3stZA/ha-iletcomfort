@@ -30,7 +30,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when its operation mode changes."""
+    """Reload the entry when its options (operation/connection mode) change.
+
+    Data-only updates, such as the coordinator persisting the discovered sn8,
+    must not trigger a reload.
+    """
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is not None and coordinator.loaded_options == dict(entry.options):
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -40,6 +47,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await coordinator.async_stop_push()
+        await coordinator.async_close_local()
         ir.async_delete_issue(
             hass, DOMAIN, OFFLINE_REPAIR_ID.format(entry_id=entry.entry_id),
         )

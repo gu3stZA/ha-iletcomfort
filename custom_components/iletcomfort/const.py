@@ -30,6 +30,24 @@ OPERATION_MODE_HA_PRIMARY = "ha_primary"
 OPERATION_MODE_PHONE_APP = "phone_app"
 DEFAULT_OPERATION_MODE = OPERATION_MODE_HA_PRIMARY
 
+# --- Connection mode: cloud vs local LAN ------------------------------------
+# Local mode sends the same C3 frames straight to the heat pump's Midea Wi-Fi
+# module over the V3 LAN protocol (TCP 6444, token/key authenticated) instead
+# of through the Dollin cloud. The cloud account is then only used, best-effort,
+# to discover the model code (sn8); polling and control never touch it.
+CONF_CONNECTION_MODE = "connection_mode"
+CONNECTION_MODE_CLOUD = "cloud"
+CONNECTION_MODE_LOCAL = "local"
+DEFAULT_CONNECTION_MODE = CONNECTION_MODE_CLOUD
+CONF_LOCAL_HOST = "local_host"
+CONF_LOCAL_TOKEN = "local_token"
+CONF_LOCAL_KEY = "local_key"
+LOCAL_PORT = 6444
+
+# sn8 model code persisted in entry data once discovered from the cloud, so
+# local mode keeps the right decode profile when the cloud is unreachable.
+CONF_SN8 = "sn8"
+
 # AWS IoT MQTT broker (TLS, mutual-cert auth). Endpoint/port come from the cert
 # response; this port is the documented default and a fallback.
 MQTT_DEFAULT_PORT = 8883

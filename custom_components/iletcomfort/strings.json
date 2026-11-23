@@ -40,6 +40,12 @@
         "ha_primary": "HA is the primary client (polling and control)",
         "phone_app": "Leave the phone app connected (read-only push)"
       }
+    },
+    "connection_mode": {
+      "options": {
+        "cloud": "Cloud (iLetComfort / Dollin)",
+        "local": "Local network (LAN, Midea V3)"
+      }
     }
   },
   "issues": {
@@ -52,11 +58,23 @@
     "step": {
       "init": {
         "title": "iLetComfort options",
-        "description": "Choose which client owns the cloud account session. HA primary keeps the existing polling and control behavior. Phone app coexistence is read-only: after an initial login to mint its MQTT certificate, HA stops account polling and blocks control commands, so the official app can remain signed in. If MQTT disconnects, entities become unavailable instead of HA taking the phone's session.",
+        "description": "Choose which client owns the cloud account session. HA primary keeps the existing polling and control behavior. Phone app coexistence is read-only: after an initial login to mint its MQTT certificate, HA stops account polling and blocks control commands, so the official app can remain signed in. If MQTT disconnects, entities become unavailable instead of HA taking the phone's session. Connection: Cloud sends commands through the iLetComfort cloud. Local network sends the same commands straight to the heat pump's Wi-Fi module on your LAN (TCP 6444); it needs the module's IP address and its Midea V3 token and key (hex, e.g. obtained with msmart-ng or Midea AC LAN). In local mode the operation mode above is ignored: there is no account polling, so the phone app can stay signed in and control still works.",
         "data": {
-          "operation_mode": "Operation mode"
+          "operation_mode": "Operation mode",
+          "connection_mode": "Connection",
+          "local_host": "Heat pump IP address (local mode)",
+          "local_token": "V3 token (local mode)",
+          "local_key": "V3 key (local mode)"
         }
       }
+    },
+    "error": {
+      "local_missing": "Local mode needs the IP address, token and key.",
+      "local_invalid_hex": "Token and key must be hexadecimal strings.",
+      "local_unsupported_device": "This device's appliance code is not a numeric Midea device ID, so local mode cannot be used.",
+      "local_auth_failed": "The heat pump rejected the token/key. Check that they belong to this device.",
+      "local_cannot_connect": "Could not reach the heat pump on TCP 6444 or it did not answer a status query. Check the IP address and that the device is on your network.",
+      "unknown": "An unexpected error occurred."
     }
   }
 }

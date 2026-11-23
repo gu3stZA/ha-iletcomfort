@@ -20,15 +20,26 @@ from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
 )
 
 from .api import ApiError, AuthError, ILetComfortClient
 from .const import (
     CONF_APPLIANCE_CODE,
+    CONF_CONNECTION_MODE,
     CONF_ENABLE_MQTT_PUSH,
+    CONF_LOCAL_HOST,
+    CONF_LOCAL_KEY,
+    CONF_LOCAL_TOKEN,
     CONF_OPERATION_MODE,
     CONF_REGION,
+    CONNECTION_MODE_CLOUD,
+    CONNECTION_MODE_LOCAL,
+    DEFAULT_CONNECTION_MODE,
     DEFAULT_ENABLE_MQTT_PUSH,
+    LOCAL_PORT,
     DEFAULT_OPERATION_MODE,
     DEFAULT_REGION,
     DOMAIN,
@@ -38,6 +49,7 @@ from .const import (
     REGION_URLS,
     REGION_US,
 )
+from .local import async_validate_local
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -186,30 +198,96 @@ class ILetComfortConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
+def _clean_hex(value: Any) -> str:
+    return str(value or "").strip().lower().replace(" ", "")
+
+
+def _is_hex(value: str) -> bool:
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return bool(value)
+
+
 class ILetComfortOptionsFlow(OptionsFlow):
     """Options for an iLetComfort entry.
 
     Select whether HA owns the account session or coexists read-only with the
-    phone app over certificate-authenticated MQTT push (issue #55). Changing
-    the mode reloads the entry (see the update listener in ``__init__``).
+    phone app over certificate-authenticated MQTT push (issue #55), and whether
+    C3 frames go via the cloud or straight to the heat pump over the LAN.
+    Changing the options reloads the entry (see the update listener in
+    ``__init__``).
     """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            data = dict(user_input)
+            if data.get(CONF_CONNECTION_MODE) == CONNECTION_MODE_LOCAL:
+                errors = await self._async_validate_local(data)
+            else:
+                # Cloud mode: keep LAN settings so switching back is one click,
+                # but only if they were provided.
+                data = {k: v for k, v in data.items() if v not in (None, "")}
+            if not errors:
+                return self.async_create_entry(data=data)
 
-        current = self.config_entry.options.get(CONF_OPERATION_MODE)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self._schema(user_input),
+            errors=errors,
+        )
+
+    async def _async_validate_local(self, data: dict[str, Any]) -> dict[str, str]:
+        """Normalize LAN fields in ``data`` and test them against the device."""
+        host = str(data.get(CONF_LOCAL_HOST) or "").strip()
+        token = _clean_hex(data.get(CONF_LOCAL_TOKEN))
+        key = _clean_hex(data.get(CONF_LOCAL_KEY))
+        if not host or not token or not key:
+            return {"base": "local_missing"}
+        if not _is_hex(token) or not _is_hex(key):
+            return {"base": "local_invalid_hex"}
+        data[CONF_LOCAL_HOST] = host
+        data[CONF_LOCAL_TOKEN] = token
+        data[CONF_LOCAL_KEY] = key
+
+        appliance_code = str(self.config_entry.data.get(CONF_APPLIANCE_CODE, ""))
+        if not appliance_code.isdigit():
+            return {"base": "local_unsupported_device"}
+
+        try:
+            await async_validate_local(
+                self.hass.loop, host, LOCAL_PORT, int(appliance_code), token, key,
+            )
+        except ApiError as err:
+            from msmart.lan import AuthenticationError
+
+            _LOGGER.warning("Local connection test to %s failed: %s", host, err)
+            if isinstance(err.__cause__, AuthenticationError):
+                return {"base": "local_auth_failed"}
+            return {"base": "local_cannot_connect"}
+        except Exception:
+            _LOGGER.exception("Unexpected error testing local connection")
+            return {"base": "unknown"}
+        return {}
+
+    def _schema(self, user_input: dict[str, Any] | None) -> vol.Schema:
+        options = {**self.config_entry.options, **(user_input or {})}
+        current = options.get(CONF_OPERATION_MODE)
         if current is None:
             current = (
                 OPERATION_MODE_PHONE_APP
-                if self.config_entry.options.get(
+                if options.get(
                     CONF_ENABLE_MQTT_PUSH, DEFAULT_ENABLE_MQTT_PUSH
                 )
                 else DEFAULT_OPERATION_MODE
             )
-        schema = vol.Schema(
+        connection = options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+        secret = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+        return vol.Schema(
             {
                 vol.Required(
                     CONF_OPERATION_MODE, default=current,
@@ -223,6 +301,26 @@ class ILetComfortOptionsFlow(OptionsFlow):
                         translation_key="operation_mode",
                     )
                 ),
+                vol.Required(
+                    CONF_CONNECTION_MODE, default=connection,
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=[CONNECTION_MODE_CLOUD, CONNECTION_MODE_LOCAL],
+                        mode=SelectSelectorMode.DROPDOWN,
+                        translation_key="connection_mode",
+                    )
+                ),
+                vol.Optional(
+                    CONF_LOCAL_HOST,
+                    description={"suggested_value": options.get(CONF_LOCAL_HOST)},
+                ): TextSelector(),
+                vol.Optional(
+                    CONF_LOCAL_TOKEN,
+                    description={"suggested_value": options.get(CONF_LOCAL_TOKEN)},
+                ): secret,
+                vol.Optional(
+                    CONF_LOCAL_KEY,
+                    description={"suggested_value": options.get(CONF_LOCAL_KEY)},
+                ): secret,
             }
         )
-        return self.async_show_form(step_id="init", data_schema=schema)
