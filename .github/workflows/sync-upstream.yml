@@ -1,0 +1,108 @@
+# Keeps this fork's local-LAN branch current with upstream releases.
+#
+# Daily (and on demand): if tgenov/ha-iletcomfort has published a release that
+# this branch does not contain yet, merge that release tag, run the full test
+# suite, and only if everything passes push the merge and publish a release
+# here (vX.Y.Z.N = upstream X.Y.Z + local mode, N counts our own builds), which
+# Home Assistant's HACS/Marketplace then offers as an update.
+#
+# On a merge conflict or a failing test nothing is pushed: the working branch
+# stays as it was and an issue is opened in this fork. Note: GITHUB_TOKEN
+# cannot push changes to workflow files, so if an upstream release edits
+# .github/workflows the push fails and is reported the same way (sync by hand).
+name: Sync upstream release
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: tgenov/ha-iletcomfort
+  BRANCH: feat/local-lan-transport
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Find latest upstream release
+        id: up
+        run: |
+          tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" \
+            "+refs/tags/$tag:refs/tags/upstream-$tag"
+          if git merge-base --is-ancestor "upstream-$tag" HEAD; then
+            echo "Already contains upstream $tag; nothing to do."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream $tag is new; merging."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream release
+        if: steps.up.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit -m "chore: merge upstream $TAG" "upstream-$TAG"
+
+      - name: Set up uv and Python
+        if: steps.up.outputs.needed == 'true'
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        if: steps.up.outputs.needed == 'true'
+        run: |
+          uv venv
+          uv pip install -r requirements_test.txt
+          uv run pytest tests/ -q
+
+      - name: Push and publish release
+        if: steps.up.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          git push origin "HEAD:$BRANCH"
+          base="${TAG#v}"
+          n=1
+          while gh release view "v$base.$n" >/dev/null 2>&1; do n=$((n + 1)); done
+          gh release create "v$base.$n" \
+            --target "$(git rev-parse HEAD)" \
+            --title "v$base.$n (upstream $TAG + local LAN mode)" \
+            --notes "Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) merged with this fork's local LAN connection mode. Tests passed in run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+
+      - name: Report failure
+        if: failure()
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          title="Upstream sync failed for ${TAG:-latest release}"
+          if gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number' | grep -q .; then
+            echo "An open issue already tracks this failure."
+            exit 0
+          fi
+          gh issue create --title "$title" --body "The scheduled sync could not merge or verify upstream ${TAG:-release}. Nothing was pushed; the installed version is unchanged.
+
+          Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          To sync by hand: \`git fetch origin --tags && git merge $TAG\`, fix conflicts, run \`pytest\`, then push \`$BRANCH\` and create a release."
