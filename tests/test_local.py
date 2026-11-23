@@ -108,11 +108,63 @@ def test_select_response_falls_back_to_last_c3_frame_for_set():
     assert select_response(set_frame, [LAN_STATUS]) == LAN_STATUS
 
 
-def test_select_response_without_c3_frame_raises():
-    with pytest.raises(ApiError):
-        select_response(STATUS_QUERY, [b"\x00\x01"])
-    with pytest.raises(ApiError):
-        select_response(STATUS_QUERY, [])
+def test_select_response_without_c3_frame_returns_none():
+    assert select_response(STATUS_QUERY, [b"\x00\x01"]) is None
+    assert select_response(STATUS_QUERY, []) is None
+
+
+# Real burst captured right after a set_hvac_mode(heat): for the sensors query
+# the module returned a late status reply (type 0x03, subtype 0x01) and two
+# unsolicited status notifications (type 0x04, subtype 0x01) -- no sensors
+# frame. Falling back to "last frame" decoded a status body as sensors
+# (water out -35 C, outdoor 0 C).
+LATE_STATUS_REPLY = bytes.fromhex(
+    "aa3dc3000000000000030101014b4b2d3f370f23372528c0000080232d3f3700233700"
+    "3f0000000000000258000001200a8203ca003b000001a2000001b9"
+)
+STATUS_NOTIFY_1 = bytes.fromhex(
+    "aa3dc3000000000000040101014b4b2d3f370f23372528c0000080232d3f3700233700"
+    "3f000000000000024e000001180a5a03ca0039000001a2000001f4"
+)
+STATUS_NOTIFY_2 = bytes.fromhex(
+    "aa3dc3000000000000040101014b4b2d3f370f23372528c0000080232d3f3700233700"
+    "3f0000000000000244000001180a3203ca0037000001a200000128"
+)
+STATUS_BURST = [LATE_STATUS_REPLY, STATUS_NOTIFY_1, STATUS_NOTIFY_2]
+
+
+def test_sensors_query_never_takes_a_status_frame():
+    assert select_response(SENSORS_QUERY, STATUS_BURST) is None
+
+
+def test_status_query_prefers_reply_over_notification():
+    assert select_response(STATUS_QUERY, STATUS_BURST) == LATE_STATUS_REPLY
+    # A notification carries the same status body, so it is acceptable when no
+    # proper reply came back.
+    assert select_response(STATUS_QUERY, [STATUS_NOTIFY_1]) == STATUS_NOTIFY_1
+
+
+def test_set_prefers_its_echo():
+    set_frame = bytes.fromhex("aa3dc3" + "00" * 6 + "02" + "00" * 52)
+    echo = bytes.fromhex("aa3dc3" + "00" * 6 + "02" + "01" * 52)
+    assert select_response(set_frame, [echo, STATUS_NOTIFY_1]) == echo
+
+
+async def test_query_resends_until_matching_reply(hass: HomeAssistant, fake_lan):
+    fake_lan.replies = [STATUS_BURST, [STATUS_NOTIFY_1, LAN_SENSORS]]
+    transport = LocalTransport(hass.loop, "10.0.0.5", 6444, DEVICE_ID, TOKEN, KEY)
+
+    assert await transport.async_send(SENSORS_QUERY) == LAN_SENSORS
+    assert fake_lan.instances[0].sent == [SENSORS_QUERY, SENSORS_QUERY]
+
+
+async def test_query_without_matching_reply_raises(hass: HomeAssistant, fake_lan):
+    fake_lan.replies = [STATUS_BURST, STATUS_BURST, STATUS_BURST]
+    transport = LocalTransport(hass.loop, "10.0.0.5", 6444, DEVICE_ID, TOKEN, KEY)
+
+    with pytest.raises(ApiError, match="no matching reply"):
+        await transport.async_send(SENSORS_QUERY)
+    assert len(fake_lan.instances[0].sent) == 3
 
 
 def test_lan_frames_decode_with_existing_decoders():

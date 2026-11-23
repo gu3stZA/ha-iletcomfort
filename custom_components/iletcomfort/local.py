@@ -25,32 +25,45 @@ from .api import ApiError
 _LOGGER = logging.getLogger(__name__)
 
 DEVICE_TYPE_C3 = 0xC3
+SET_MESSAGE_TYPE = 0x02
 QUERY_MESSAGE_TYPE = 0x03
+NOTIFY_MESSAGE_TYPE = 0x04
+
+# Attempts per command. After a state change the module streams unsolicited
+# status notifications (message type 0x04), so the reply to a query can arrive
+# late, behind them; resending lets it be picked up on the next read.
+SEND_ATTEMPTS = 3
 
 
 def _is_c3_frame(frame: bytes) -> bool:
     return len(frame) >= 12 and frame[0] == 0xAA and frame[2] == DEVICE_TYPE_C3
 
 
-def select_response(request: bytes, responses: list[bytes]) -> bytes:
-    """Pick the reply frame that answers ``request``.
+def select_response(request: bytes, responses: list[bytes]) -> bytes | None:
+    """Pick the reply frame that answers ``request``, or None if none does.
 
-    The module may also deliver unsolicited status frames on the same
-    connection. For a query (message type 0x03) prefer the C3 reply whose body
-    subtype matches the queried subtype; otherwise take the last C3 frame.
+    The module also delivers unsolicited frames on the same connection: status
+    notifications (message type 0x04, body subtype 0x01), and late replies to
+    earlier requests. A query must only ever be answered by a frame carrying
+    the same body subtype, otherwise a status body would be decoded as sensors
+    (and vice versa). Query replies (0x03) win over notifications (0x04) with
+    the same subtype; the newest frame wins within each group.
+
+    For a SET (0x02) the echo is preferred, falling back to the newest C3
+    frame; ``set_device`` does not interpret the reply.
     """
     frames = [bytes(f) for f in responses if _is_c3_frame(bytes(f))]
-    if not frames:
-        raise ApiError(
-            "Local command got no C3 reply"
-            + (f" (raw: {[bytes(r).hex() for r in responses]})" if responses else "")
-        )
     if len(request) > 10 and request[9] == QUERY_MESSAGE_TYPE:
         subtype = request[10]
-        for frame in reversed(frames):
-            if frame[10] == subtype:
-                return frame
-    return frames[-1]
+        for wanted_type in (QUERY_MESSAGE_TYPE, NOTIFY_MESSAGE_TYPE):
+            for frame in reversed(frames):
+                if frame[9] == wanted_type and frame[10] == subtype:
+                    return frame
+        return None
+    for frame in reversed(frames):
+        if frame[9] == SET_MESSAGE_TYPE:
+            return frame
+    return frames[-1] if frames else None
 
 
 def _lan_errors() -> tuple[type[BaseException], ...]:
@@ -125,13 +138,32 @@ class LocalTransport:
         if self._lock is None:
             self._lock = asyncio.Lock()
         errors = _lan_errors()
+        is_query = len(frame) > 10 and frame[9] == QUERY_MESSAGE_TYPE
         async with self._lock:
             try:
                 async with asyncio.timeout(self._timeout):
                     if self._lan is None:
                         await self._async_connect()
-                    _LOGGER.debug("Local send to %s: %s", self._host, frame.hex())
-                    responses = await self._lan.send(frame)
+                    for attempt in range(1, SEND_ATTEMPTS + 1):
+                        _LOGGER.debug(
+                            "Local send to %s (attempt %d): %s",
+                            self._host, attempt, frame.hex(),
+                        )
+                        responses = await self._lan.send(frame)
+                        _LOGGER.debug(
+                            "Local replies from %s: %s",
+                            self._host,
+                            [bytes(r).hex() for r in responses],
+                        )
+                        reply = select_response(frame, responses)
+                        if reply is not None:
+                            return reply
+                        if not is_query:
+                            break
+                        # Only unrelated frames so far: give the real reply a
+                        # moment to arrive, then resend (stale frames are
+                        # drained into the next send's responses).
+                        await asyncio.sleep(0.5)
             except errors as err:
                 # Drop the connection so the next call starts a fresh
                 # connect + V3 handshake instead of reusing a dead session.
@@ -140,12 +172,10 @@ class LocalTransport:
                     f"Local command to {self._host} failed: "
                     f"{type(err).__name__}: {err}"
                 ) from err
-            _LOGGER.debug(
-                "Local replies from %s: %s",
-                self._host,
-                [bytes(r).hex() for r in responses],
-            )
-            return select_response(frame, responses)
+        raise ApiError(
+            f"Local command to {self._host} got no matching reply for "
+            f"{frame.hex()}"
+        )
 
     async def _async_connect(self) -> None:
         from msmart.lan import LAN
