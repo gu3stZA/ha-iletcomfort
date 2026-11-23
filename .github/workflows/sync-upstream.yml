@@ -16,6 +16,11 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Merge and test only; push nothing, publish no release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -27,7 +32,9 @@ concurrency:
 
 env:
   UPSTREAM: tgenov/ha-iletcomfort
-  BRANCH: feat/local-lan-transport
+  # Scheduled runs use the default branch (feat/local-lan-transport); a manual
+  # run syncs whichever branch it was started on.
+  BRANCH: ${{ github.ref_name }}
 
 jobs:
   sync:
@@ -78,7 +85,7 @@ jobs:
           uv run pytest tests/ -q
 
       - name: Push and publish release
-        if: steps.up.outputs.needed == 'true'
+        if: steps.up.outputs.needed == 'true' && !inputs.dry_run
         env:
           TAG: ${{ steps.up.outputs.tag }}
         run: |
@@ -92,7 +99,7 @@ jobs:
             --notes "Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) merged with this fork's local LAN connection mode. Tests passed in run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
 
       - name: Report failure
-        if: failure()
+        if: failure() && !inputs.dry_run
         env:
           TAG: ${{ steps.up.outputs.tag }}
         run: |
