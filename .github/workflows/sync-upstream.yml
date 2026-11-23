@@ -73,7 +73,8 @@ jobs:
 
       - name: Set up uv and Python
         if: steps.up.outputs.needed == 'true'
-        uses: astral-sh/setup-uv@v5
+        # Same setup as the project's own tests.yml.
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
 
