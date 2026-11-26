@@ -66,7 +66,36 @@ python3 -m venv .venv
 .venv/bin/pytest tests/
 ```
 
-CI runs the same suite on every PR via `.github/workflows/tests.yml`.
+CI runs the same suite on every PR via `.github/workflows/tests.yml`, plus `ruff`, `mypy`, `hassfest`, and `HACS` validation via `.github/workflows/validate.yml`.
+
+## Mandatory Pre-PR Self-Review (Clean Context)
+
+Before opening or pushing a PR for review, **always perform a self-review of the full diff in a fresh, clean context** (for AI agents: invoke an independent read-only subagent with zero shared session bias; for humans: review the complete `git diff main...HEAD` from scratch).
+
+Check explicitly for:
+1. **Correctness & edge cases:** cache fallbacks, MQTT push vs. poll parity, transient cloud errors vs. permanent capability latching, listener teardown on unload/profile change.
+2. **Backwards compatibility:** HA entity `unique_id`, `device_class`, `state_class`, `native_unit_of_measurement`, and `ConfigEntry` rollback safety (`tests/test_hardware_corpus.py`).
+3. **Privacy & redaction:** no tokens, credentials, full `applianceCode`, or per-device serials in logs, diagnostics, or test fixtures.
+4. **Local quality gates:** `pytest`, `ruff check .`, and `mypy custom_components/iletcomfort/` all green before pushing.
+
+## Reading raw C3 frames (`scripts/c3_probe.py`)
+
+A dev-only, **read-only** probe for `sn8 171H120F` units: it sends C3 queries
+(message type `0x03`) and decodes the replies; it cannot send control frames.
+Put exactly these keys in a git-ignored `.env` in the repository root — no
+other key is read:
+
+```
+ILET_EMAIL=...
+ILET_PASSWORD=...
+ILET_REGION=eu
+```
+
+Disable the Home Assistant integration first (one active session per account),
+then run `python3 scripts/c3_probe.py status`, `probe` (every known query body
+type) or `decode "<hex>"` (offline). Replies are appended to the git-ignored
+`captures/c3_probe.jsonl` without account data, tokens or the full appliance
+code.
 
 ## Fetching a vendor plugin bundle (reverse-engineering aid)
 

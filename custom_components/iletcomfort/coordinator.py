@@ -12,11 +12,12 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.core import HassJob, HomeAssistant
+from homeassistant.core import HassJob, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+import requests
 
 from .api import (
     AppCert,
@@ -28,10 +29,12 @@ from .api import (
     QUERY_TO_SET_MODE,
     mask_identifier,
 )
+from .capabilities import DeviceCapabilities
 from .const import (
     CONF_APPLIANCE_CODE,
     CONF_CONNECTION_MODE,
     CONF_ENABLE_MQTT_PUSH,
+    CONF_KJRH120L_ZONE1_CAPABLE,
     CONF_LOCAL_HOST,
     CONF_LOCAL_KEY,
     CONF_LOCAL_TOKEN,
@@ -51,12 +54,18 @@ from .const import (
     MQTT_STATUS_STALE_AFTER,
 )
 from .model_profiles import (
-    apply_profile_to_sensors,
-    apply_profile_to_status,
+    ATW_HMI_PARAMS_MIN_LEN,
+    ATW_UNIT_PARAMS_MIN_LEN,
+    ModelProfile,
+    apply_atw_hmi_params,
+    apply_atw_unit_params,
+    atw_sensors_are_placeholder,
+    kjrh120l_has_zone1,
     resolve_profile,
 )
 from .local import LocalTransport
 from .mqtt import ILetComfortPushClient
+from .protocols import HeatPumpState, get_adapter
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -89,9 +98,6 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
         )
         self.entry = entry
-        # Options this coordinator was built from; the update listener reloads
-        # only when these change (not on data-only updates like sn8 persist).
-        self.loaded_options: dict[str, Any] = dict(entry.options)
         region = entry.data.get(CONF_REGION, DEFAULT_REGION)
         api_base = REGION_URLS.get(region, REGION_URLS[DEFAULT_REGION])
         self.client = ILetComfortClient(api_base=api_base)
@@ -107,6 +113,10 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else DEFAULT_OPERATION_MODE
             )
         self._operation_mode: str = operation_mode
+        # Options this coordinator was built with. The entry update listener
+        # reloads only when these change, so a data-only update (the KJRH-120L
+        # Zone 1 latch, the persisted sn8) does not reload the entry.
+        self.options_snapshot: dict[str, Any] = dict(entry.options)
         # Local (LAN) mode: C3 frames go straight to the heat pump. No account
         # polling happens, so there is no login war with the phone app and
         # neither MQTT push nor the phone-app write lock applies.
@@ -152,6 +162,24 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._repair_issued = False
         self._last_push_status_at: float | None = None
         self._push_status_watchdog: Callable[[], None] | None = None
+        # Centralized runtime probe / capability state (#171).
+        self.capabilities = DeviceCapabilities()
+
+    @property
+    def _atw_unit_params_supported(self) -> bool | None:
+        return self.capabilities.atw_unit_params.supported
+
+    @_atw_unit_params_supported.setter
+    def _atw_unit_params_supported(self, value: bool | None) -> None:
+        self.capabilities.atw_unit_params.supported = value
+
+    @property
+    def _atw_hmi_params_supported(self) -> bool | None:
+        return self.capabilities.atw_hmi_params.supported
+
+    @_atw_hmi_params_supported.setter
+    def _atw_hmi_params_supported(self, value: bool | None) -> None:
+        self.capabilities.atw_hmi_params.supported = value
 
     @property
     def last_on_state(self) -> tuple[int, int] | None:
@@ -178,6 +206,39 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def is_local(self) -> bool:
         """Return True when C3 frames go over the LAN instead of the cloud."""
         return self.local_transport is not None
+
+    @property
+    def kjrh120l_zone1_capable(self) -> bool:
+        """Return whether this KJRH-120L has ever reported a Zone 1.
+
+        True once ``_observe_kjrh120l_zone1`` has latched the flag in
+        ``entry.data``. The profile is checked as well, so the flag never
+        enables Zone 1 entities on another model.
+        """
+        return (
+            resolve_profile(self.sn8) is ModelProfile.KJRH120L
+            and self.entry.data.get(CONF_KJRH120L_ZONE1_CAPABLE) is True
+        )
+
+    @callback
+    def _observe_kjrh120l_zone1(self, status: ITSStatus) -> None:
+        """Latch Zone 1 capability the first time a KJRH-120L frame shows it.
+
+        ``kjrh120l_has_zone1`` reads body[8:10], the Zone 1 / Zone 2 power
+        state, which drops to 00 00 while Zone 1 is off (snapshot 2026-11-18).
+        One positive frame is therefore kept in ``entry.data`` and never
+        cleared by a later frame.
+        """
+        if self.kjrh120l_zone1_capable:
+            return
+        if resolve_profile(self.sn8) is not ModelProfile.KJRH120L:
+            return
+        if not kjrh120l_has_zone1(status.raw_body):
+            return
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_KJRH120L_ZONE1_CAPABLE: True},
+        )
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch status and sensors from the heat pump."""
@@ -239,8 +300,9 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if resolve_profile(self.sn8) is not previous_profile:
             # Cached values and power-restore state used the old byte layout.
             # They cannot be used as fallback for the newly discovered model.
-            self.data = None
+            self.data = None  # type: ignore[assignment]
             self._last_on_state = None
+            self.capabilities.reset_probes()
         cached = self.data or {}
         sn8 = self.sn8
 
@@ -329,14 +391,114 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 temp = int(status.t5s_def) if status.t5s_def is not None else status.set_temperature
                 self._last_on_state = (set_mode, temp)
 
-        # Apply any model-specific sensors override (e.g. ATW/AQUAPURA route a
-        # tank/water temp into twin_temp, the field the climate
-        # current_temperature and Water Inlet sensor read). STANDARD is a no-op.
-        sensors = apply_profile_to_sensors(resolve_profile(sn8), sensors, status)
+        # Apply any model-specific sensors override via the resolved protocol
+        # adapter (e.g. ATW/AQUAPURA route tank temp into th_temp).
+        adapter = get_adapter(sn8)
+        profile = adapter.profile
+        sensors = adapter.decode_sensors(sensors, status)
+
+        raw_frames: dict[int, bytes] = {}
+        if status.raw_body:
+            raw_frames[0x01] = bytes(status.raw_body)
+        if self._sensors_degraded:
+            cached_0x02 = (cached.get("raw_frames") or {}).get(0x02)
+            if cached_0x02:
+                raw_frames[0x02] = bytes(cached_0x02)
+        elif sensors.raw_body and sensors.raw_body[:1] == b"\x02":
+            raw_frames[0x02] = bytes(sensors.raw_body)
+
+        # On ATW (171H120F) units whose 0x02 frame is a non-telemetry schedule
+        # template, probe subtype 0x10 once for live telemetry (#120). Units
+        # that reject 0x10 on the initial probe (e.g. code=1214 on Rotenso)
+        # latch unsupported; transient errors after 0x10 is already confirmed
+        # retry on the next poll without permanently disabling telemetry.
+        if (
+            profile is ModelProfile.ATW
+            and atw_sensors_are_placeholder(raw_frames.get(0x02, b""))
+            and self.capabilities.atw_unit_params.should_probe
+        ):
+            try:
+                unit_body = await self.hass.async_add_executor_job(
+                    self.client.query_atw_unit_params, self.appliance_code,
+                )
+            except AuthError:
+                raise
+            except ApiError as err:
+                if self.capabilities.atw_unit_params.supported is None:
+                    self.capabilities.atw_unit_params.mark_unsupported(str(err))
+                    _LOGGER.info(
+                        "ATW subtype 0x10 unit parameters not supported (%s); "
+                        "disabling 0x10 telemetry polling for this session",
+                        err,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Transient ATW subtype 0x10 ApiError (retrying next poll): %s",
+                        err,
+                    )
+            except Exception as err:  # noqa: BLE001 — transient error, retry later
+                _LOGGER.debug("ATW subtype 0x10 query failed: %s", err)
+            else:
+                if (
+                    isinstance(unit_body, (bytes, bytearray))
+                    and len(unit_body) >= ATW_UNIT_PARAMS_MIN_LEN
+                ):
+                    self.capabilities.atw_unit_params.mark_supported()
+                    raw_frames[0x10] = bytes(unit_body)
+                    status, sensors = apply_atw_unit_params(
+                        unit_body, status, sensors
+                    )
+                    if self.capabilities.atw_hmi_params.should_probe:
+                        try:
+                            hmi_body = await self.hass.async_add_executor_job(
+                                self.client.query_atw_hmi_params,
+                                self.appliance_code,
+                            )
+                        except AuthError:
+                            raise
+                        except ApiError as err:
+                            if self.capabilities.atw_hmi_params.supported is None:
+                                self.capabilities.atw_hmi_params.mark_unsupported(
+                                    str(err)
+                                )
+                                _LOGGER.info(
+                                    "ATW subtype 0x0A HMI parameters not supported "
+                                    "(%s); disabling 0x0A polling for this session",
+                                    err,
+                                )
+                            else:
+                                _LOGGER.debug(
+                                    "Transient ATW subtype 0x0A ApiError "
+                                    "(retrying next poll): %s",
+                                    err,
+                                )
+                        except Exception as err:  # noqa: BLE001 — transient error
+                            _LOGGER.debug("ATW subtype 0x0A query failed: %s", err)
+                        else:
+                            if (
+                                isinstance(hmi_body, (bytes, bytearray))
+                                and len(hmi_body) >= ATW_HMI_PARAMS_MIN_LEN
+                            ):
+                                self.capabilities.atw_hmi_params.mark_supported()
+                                raw_frames[0x0A] = bytes(hmi_body)
+                                status = apply_atw_hmi_params(hmi_body, status)
 
         self._update_offline_repair()
+        self._observe_kjrh120l_zone1(status)
 
-        return {"status": status, "sensors": sensors}
+        state = HeatPumpState(
+            profile=profile,
+            variant=adapter.describe_variant(status),
+            status=status,
+            sensors=sensors,
+            raw_frames=dict(raw_frames),
+        )
+        return {
+            "status": status,
+            "sensors": sensors,
+            "raw_frames": raw_frames,
+            "state": state,
+        }
 
     def _update_offline_repair(self) -> None:
         """Surface or clear the 'device appears offline' Repair card.
@@ -468,12 +630,15 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         await self.async_start_push()
 
-    async def async_set_device(self, **kwargs: Any) -> None:
-        """Send a SET command with auto re-auth, then refresh data.
+    async def async_execute_command(self, action: Callable[[], Any]) -> Any:
+        """Run a blocking write command with uniform safety, re-auth, and refresh.
 
-        The appliance ``sn8`` is forwarded so the client can branch the write
-        encoding per model (e.g. the KJRH-120L's short commands vs the legacy
-        C3 SET frame); see ``model_profiles`` and ``ILetComfortClient.set_device``.
+        Centralizes the write contract for every protocol dialect (#172):
+        1. Rejects writes in read-only phone-app coexistence mode.
+        2. Retries once on ``AuthError`` after re-authenticating.
+        3. Translates client/validation/network errors into ``HomeAssistantError``
+           without triggering a spurious refresh.
+        4. Requests a coordinator refresh on success.
         """
         if self._operation_mode == OPERATION_MODE_PHONE_APP and not self.is_local:
             raise HomeAssistantError(
@@ -481,28 +646,41 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "switch to HA primary mode to send commands"
             )
 
-        sn8 = self.sn8
         try:
-            await self.hass.async_add_executor_job(
-                lambda: self.client.set_device(
-                    self.appliance_code,
-                    sn8=sn8,
-                    last_on_state=self._last_on_state,
-                    **kwargs,
-                )
-            )
-        except AuthError:
-            _LOGGER.info("Auth error during set, re-authenticating")
-            await self._async_login()
-            await self.hass.async_add_executor_job(
-                lambda: self.client.set_device(
-                    self.appliance_code,
-                    sn8=sn8,
-                    last_on_state=self._last_on_state,
-                    **kwargs,
-                )
-            )
+            try:
+                result = await self.hass.async_add_executor_job(action)
+            except AuthError:
+                _LOGGER.info("Auth error during set, re-authenticating")
+                await self._async_login()
+                result = await self.hass.async_add_executor_job(action)
+        except (
+            ApiError,
+            AuthError,
+            ValueError,
+            requests.RequestException,
+        ) as err:
+            raise HomeAssistantError(f"Heat pump command failed: {err}") from err
         await self.async_request_refresh()
+        return result
+
+    async def async_set_device(self, **kwargs: Any) -> None:
+        """Send a SET command with auto re-auth, then refresh data.
+
+        The appliance ``sn8`` is forwarded so the client can branch the write
+        encoding per model (e.g. the KJRH-120L's short commands vs the legacy
+        C3 SET frame); see ``model_profiles`` and ``ILetComfortClient.set_device``.
+        """
+        sn8 = self.sn8
+
+        def _send() -> Any:
+            return self.client.set_device(
+                self.appliance_code,
+                sn8=sn8,
+                last_on_state=self._last_on_state,
+                **kwargs,
+            )
+
+        await self.async_execute_command(_send)
 
     # -- MQTT real-time push (issue #55, phone-app coexistence mode) --
 
@@ -589,9 +767,27 @@ class ILetComfortCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # with no sensors (entities read coordinator.data["sensors"]); the
             # imminent first poll delivers a complete snapshot.
             return
-        status = apply_profile_to_status(resolve_profile(self.sn8), status)
+        adapter = get_adapter(self.sn8)
+        status = adapter.decode_status(status)
+        self._observe_kjrh120l_zone1(status)
+        raw_frames = dict(self.data.get("raw_frames") or {})
+        if status.raw_body:
+            raw_frames[0x01] = bytes(status.raw_body)
+        sensors = self.data.get("sensors")
+        state = HeatPumpState(
+            profile=adapter.profile,
+            variant=adapter.describe_variant(status),
+            status=status,
+            sensors=sensors,
+            raw_frames=dict(raw_frames),
+        )
         self.async_set_updated_data(
-            {"status": status, "sensors": self.data.get("sensors")}
+            {
+                "status": status,
+                "sensors": sensors,
+                "raw_frames": raw_frames,
+                "state": state,
+            }
         )
 
     def _cancel_push_status_watchdog(self) -> None:

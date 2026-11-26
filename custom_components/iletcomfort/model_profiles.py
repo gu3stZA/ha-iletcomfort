@@ -53,9 +53,20 @@ validated tank behavior; AQUAPURA returns ``th_temp`` and STANDARD returns
 from __future__ import annotations
 
 import dataclasses
+import math
 from enum import Enum
+from typing import Any
 
-from .api import MODE_HEAT, MODE_OFF, ITSSensors, ITSStatus
+from .api import (
+    MODE_HEAT,
+    MODE_OFF,
+    STATUS_MODE_COOL,
+    STATUS_MODE_HEAT,
+    STATUS_MODE_OFF,
+    ITSSensors,
+    ITSStatus,
+)
+from .c3_basic import C3BasicStatus, decode_c3_basic
 
 # sn8 model codes (8-char serial prefixes) → profile.
 ATW_SN8 = "171H120F"
@@ -161,6 +172,16 @@ def _is_27_byte_atw_status(body: bytearray | bytes) -> bool:
     return len(body) == 27 and body[0] == 0x01 and body[3:6] == b"\xa0\x03\x03"
 
 
+def _is_rotenso_atw_status(body: bytearray | bytes) -> bool:
+    """Return whether ``body`` has the validated 25-byte Rotenso layout (#124).
+
+    Only ``[2] == 0x15`` is validated. Other 25-byte capability masks
+    (Italtherm 0x07, Kaisai 0x11, ...) keep the established decode, where
+    byte[1] bit 0 is space-heat demand rather than Zone-1 power.
+    """
+    return len(body) == 25 and body[0] == 0x01 and body[2] == 0x15
+
+
 def decode_atw_status(body: bytearray | bytes) -> ITSStatus:
     """Decode an ATW (sn8 171H120F) status frame into an ITSStatus.
 
@@ -213,6 +234,29 @@ def decode_atw_status(body: bytearray | bytes) -> ITSStatus:
     else:
         status.comp_running = False
 
+    # Every 171H120F capture so far also matches the standard Midea C3 basic
+    # layout (see c3_basic); keep the raw decode for entities that need it.
+    basic = decode_c3_basic(body)
+    status.c3_basic = basic
+    if basic is not None and _is_rotenso_atw_status(body):
+        # Rotenso Aquami layout (#124): byte[1] bit 0 is the Zone-1 power
+        # switch. Confirmed by the #124 reporter (heating on in the app while
+        # the old decode said Off) and on a second unit by switching Zone-1
+        # on from Home Assistant and seeing it in the official app. Byte[4]
+        # carries the operating mode, so a powered zone in Cool is reported
+        # as Cool, never as Heat. The setpoint mapping above is unchanged
+        # (#124 reports the app showing byte[9] / 2 on that unit).
+        if basic.zone1_power:
+            cooling = basic.is_cooling_mode
+            status.mode = STATUS_MODE_COOL if cooling else STATUS_MODE_HEAT
+            status.mode_name = "Cool" if cooling else "Heat"
+        else:
+            status.mode = STATUS_MODE_OFF
+            status.mode_name = "Off"
+        # The frame has no compressor signal: unknown rather than False/0.
+        status.comp_running = None
+        status.comp_frq = None
+
     return status
 
 
@@ -264,6 +308,26 @@ KJRH120L_ZONE1_CAP_INDEX_B = 9
 KJRH120L_ZONE1_SETPOINT_INDEX = 12
 KJRH120L_DHW_TEMP_MIN = 35
 KJRH120L_DHW_TEMP_MAX = 60
+# Zone 1 fields in the subtype 0x01 body. Write field N of group 00 lands at
+# body[8 + N]: two status snapshots (2026-11-12, 2026-11-18) agree with the
+# vendor fullQuery taken at the same moment, and the app's writes read back.
+KJRH120L_ZONE1_POWER_INDEX = 8  # field 0x00, 1 = on, 0 = off
+KJRH120L_RUN_MODE_INDEX = 11  # field 0x03
+KJRH120L_RUN_MODE_HEAT = 3
+KJRH120L_RUN_MODE_COOL = 2
+# fullQuery zone1_heat_max/min = 75/35 and zone1_cool_max/min = 25/5 sit at
+# body[37..40] in both snapshots.
+KJRH120L_ZONE1_HEAT_MAX_INDEX = 37
+KJRH120L_ZONE1_HEAT_MIN_INDEX = 38
+KJRH120L_ZONE1_COOL_MAX_INDEX = 39
+KJRH120L_ZONE1_COOL_MIN_INDEX = 40
+# Outdoor ambient temperature (T4) in status subtype 0x01: raw = T4 + 196.
+# Confirmed across four independent units (#148 Snapshots A/B: 12/8 °C,
+# #142: 10 °C, #136: 10 °C, plus #119 diurnal 9→21 °C). 0xFF is sentinel fill.
+KJRH120L_OUTDOOR_TEMP_INDEX = 57
+KJRH120L_OUTDOOR_TEMP_OFFSET = 196
+KJRH120L_OUTDOOR_TEMP_MIN = -50
+KJRH120L_OUTDOOR_TEMP_MAX = 58
 _KJRH120L_MODES = {0: "Off", 1: "Heat", 2: "Cool", 3: "Auto", 4: "Water Pump"}
 
 # Temperature fields suppressed for the KJRH-120L (not exposed by its API).
@@ -311,6 +375,8 @@ _ATW_PLACEHOLDER_SENSOR_FIELDS = {
 # groups sharing one ``c``, with at most a single 0x00 between groups.
 _ATW_TEMPLATE_GROUP_LEN = 6
 _ATW_TEMPLATE_MIN_GROUPS = 6
+_ATW_ACTIVE_SCHEDULE_LEN = 2 + _ATW_TEMPLATE_MIN_GROUPS * _ATW_TEMPLATE_GROUP_LEN
+_ATW_ACTIVE_SCHEDULE_TAGS = (0x03, 0x05)
 
 
 def _atw_sensors_match_template_shape(raw_body: bytes) -> bool:
@@ -338,11 +404,168 @@ def _atw_sensors_match_template_shape(raw_body: bytes) -> bool:
     return groups >= _ATW_TEMPLATE_MIN_GROUPS and not after_separator
 
 
+def _atw_sensors_match_active_schedule_shape(raw_body: bytes) -> bool:
+    """Match 38-byte ATW 0x02 schedule frames with active 03/05 timer slots.
+
+    Airwell Wellea M (#128) and Sinclair MSH-100IB-3/9 (#150) emit 38-byte
+    ``0x02`` frames of six 6-byte ``[mode, target, start_h, start_m, end_h,
+    end_m]`` schedule slots with a 6-bit enable mask in ``body[1]`` (``0x00``
+    or ``0x0a``). Active slots can carry ``0x05`` with a different target byte
+    than idle ``0x03`` slots, while every slot carries valid ``HH:MM`` clock
+    bytes and idle ``00:00-00:00`` slots share one uniform ``03,<c>`` header.
+    """
+    if (
+        len(raw_body) != _ATW_ACTIVE_SCHEDULE_LEN
+        or raw_body[0] != 0x02
+        or raw_body[1] > 0x3F
+    ):
+        return False
+    idle_header: tuple[int, int] | None = None
+    has_active_slot = False
+    for offset in range(2, len(raw_body), _ATW_TEMPLATE_GROUP_LEN):
+        tag, val, start_h, start_m, end_h, end_m = raw_body[
+            offset : offset + _ATW_TEMPLATE_GROUP_LEN
+        ]
+        if tag not in _ATW_ACTIVE_SCHEDULE_TAGS or not (0 < val <= 0x50):
+            return False
+        if not (
+            start_h <= 23 and start_m <= 59 and end_h <= 23 and end_m <= 59
+        ):
+            return False
+        if (start_h, start_m, end_h, end_m) == (0, 0, 0, 0):
+            if tag != 0x03:
+                return False
+            if idle_header is None:
+                idle_header = (tag, val)
+            elif idle_header != (tag, val):
+                return False
+        else:
+            has_active_slot = True
+    return has_active_slot
+
+
 def atw_sensors_are_placeholder(raw_body: bytes) -> bool:
     """Return whether an ATW sensor frame is a known non-telemetry template."""
-    return raw_body == _ATW_PLACEHOLDER_SENSORS_BODY or _atw_sensors_match_template_shape(
-        bytes(raw_body)
+    raw = bytes(raw_body)
+    return (
+        raw == _ATW_PLACEHOLDER_SENSORS_BODY
+        or _atw_sensors_match_template_shape(raw)
+        or _atw_sensors_match_active_schedule_shape(raw)
     )
+
+
+# ---------------------------------------------------------------------------
+# ATW subtype 0x10 ("unit parameters") live telemetry (issue #120)
+# ---------------------------------------------------------------------------
+#
+# Some 171H120F units (e.g. NØRDIS Optimus Pro, #120) return a schedule
+# template on subtype 0x02 but answer subtype 0x10 with live telemetry verified
+# against the physical controller's service menu (direct signed int8 °C,
+# 0x7F = sensor not connected). Other 171H120F firmwares (e.g. Rotenso #143)
+# reject 0x10 with code=1214, so polling is gated on an ATW placeholder 0x02
+# frame and self-disables on the first ApiError.
+ATW_UNIT_PARAMS_SUBTYPE = 0x10
+ATW_UNIT_PARAMS_MIN_LEN = 65
+ATW_UNIT_PARAMS_ENERGY_MIN_LEN = 71
+_ATW_UNIT_SENSOR_DISCONNECTED = 0x7F
+
+
+def _atw_unit_s8(raw_byte: int) -> float | None:
+    """Decode a signed 8-bit °C byte from ATW subtype 0x10 (0x7F = absent)."""
+    if raw_byte == _ATW_UNIT_SENSOR_DISCONNECTED:
+        return None
+    return float(raw_byte - 256 if raw_byte > 127 else raw_byte)
+
+
+def apply_atw_unit_params(
+    unit_body: bytes | bytearray,
+    status: ITSStatus,
+    sensors: ITSSensors,
+) -> tuple[ITSStatus, ITSSensors]:
+    """Overlay hardware-validated ATW subtype 0x10 telemetry onto status/sensors.
+
+    Unvalidated bytes (e.g. fan speed, low pressure, disabled sensors) are left
+    untouched. Returns inputs unchanged if ``unit_body`` is not a valid 0x10
+    payload.
+    """
+    body = bytes(unit_body)
+    if len(body) < ATW_UNIT_PARAMS_MIN_LEN or body[0] != ATW_UNIT_PARAMS_SUBTYPE:
+        return status, sensors
+
+    comp_frq = body[1]
+    status_updates: dict[str, Any] = {
+        "comp_frq": comp_frq,
+        "comp_running": comp_frq > 0,
+        "exv_drg": (body[20] << 8) | body[21],
+        "pressure_h": (body[43] << 8) | body[44],
+    }
+    if len(body) >= ATW_UNIT_PARAMS_ENERGY_MIN_LEN:
+        status_updates["total_kwh"] = (
+            (body[67] << 24) | (body[68] << 16) | (body[69] << 8) | body[70]
+        )
+
+    sensor_updates: dict[str, Any] = {
+        "t3_temp": _atw_unit_s8(body[7]),
+        "t4_temp": _atw_unit_s8(body[8]),
+        "tp_temp": _atw_unit_s8(body[9]),
+        "twin_temp": _atw_unit_s8(body[10]),
+        "twout_temp": _atw_unit_s8(body[11]),
+        "odu_voltage": (body[18] << 8) | body[19],
+        "t1_temp": _atw_unit_s8(body[34]),
+        "t2_temp": _atw_unit_s8(body[36]),
+        "t2b_temp": _atw_unit_s8(body[37]),
+        "dc_current": body[50],
+        "dc_voltage": body[51] * 10,
+        "tf_temp": _atw_unit_s8(body[52]),
+        "water_flow": (body[55] << 8) | body[56],
+        "raw_body": body,
+    }
+    if sensors.th_temp is None:
+        tank = _atw_unit_s8(body[38])
+        if tank is not None:
+            sensor_updates["th_temp"] = tank
+
+    return (
+        dataclasses.replace(status, **status_updates),
+        dataclasses.replace(sensors, **sensor_updates),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ATW subtype 0x0A ("HMI parameters") compressor run hours (issues #120 / #139)
+# ---------------------------------------------------------------------------
+#
+# On 171H120F units that answer subtype 0x10 (e.g. NØRDIS #120, Airwell #139),
+# compressor total run hours live in subtype 0x0A body[4..5] (big-endian uint16,
+# verified on NØRDIS #120: 0x1c, 0x8f → 7311 Hrs matching service menu).
+ATW_HMI_PARAMS_SUBTYPE = 0x0A
+ATW_HMI_PARAMS_MIN_LEN = 6
+
+
+def apply_atw_hmi_params(
+    hmi_body: bytes | bytearray,
+    status: ITSStatus,
+) -> ITSStatus:
+    """Overlay verified ATW subtype 0x0A compressor run hours onto status.
+
+    Returns ``status`` unchanged if ``hmi_body`` is not a valid 0x0A payload.
+    """
+    body = bytes(hmi_body)
+    if len(body) < ATW_HMI_PARAMS_MIN_LEN or body[0] != ATW_HMI_PARAMS_SUBTYPE:
+        return status
+    comp_total_run_hours = (body[4] << 8) | body[5]
+    return dataclasses.replace(status, comp_total_run_hours=comp_total_run_hours)
+
+
+def atw_c3_basic(sn8: str | None, status: ITSStatus | None) -> C3BasicStatus | None:
+    """Return the decoded C3 basic status for an ATW unit, else None.
+
+    Requires both the ATW profile (sn8 171H120F) and a status frame that
+    matched the C3 basic layout, so entities never rely on the sn8 alone.
+    """
+    if status is None or resolve_profile(sn8) is not ModelProfile.ATW:
+        return None
+    return status.c3_basic
 
 
 def kjrh120l_has_zone1(body: bytearray | bytes) -> bool:
@@ -397,7 +620,38 @@ def decode_kjrh120l_status(body: bytearray | bytes) -> ITSStatus:
             status.t5s_def = float(dhw_setpoint)
             status.set_temperature = dhw_setpoint
 
+    _decode_kjrh120l_zone1(status, body)
     return status
+
+
+def _decode_kjrh120l_zone1(status: ITSStatus, body: bytearray | bytes) -> None:
+    """Fill the Zone 1 fields of ``status`` from a KJRH-120L status body.
+
+    Independent of ``kjrh120l_has_zone1``: body[8] is the Zone 1 power state
+    itself, so it reads 0 whenever the zone is off. A byte the frame does not
+    carry leaves its field None.
+    """
+    body_len = len(body)
+    if body_len > KJRH120L_ZONE1_POWER_INDEX:
+        status.kjrh120l_zone1_power = {0: False, 1: True}.get(
+            body[KJRH120L_ZONE1_POWER_INDEX]
+        )
+    if body_len > KJRH120L_RUN_MODE_INDEX:
+        status.kjrh120l_run_mode = body[KJRH120L_RUN_MODE_INDEX]
+    if body_len > KJRH120L_ZONE1_SETPOINT_INDEX:
+        status.kjrh120l_zone1_setpoint = float(body[KJRH120L_ZONE1_SETPOINT_INDEX])
+    # Read the four limits only when the frame carries all of them.
+    if body_len > KJRH120L_ZONE1_COOL_MIN_INDEX:
+        status.kjrh120l_zone1_heat_max = body[KJRH120L_ZONE1_HEAT_MAX_INDEX]
+        status.kjrh120l_zone1_heat_min = body[KJRH120L_ZONE1_HEAT_MIN_INDEX]
+        status.kjrh120l_zone1_cool_max = body[KJRH120L_ZONE1_COOL_MAX_INDEX]
+        status.kjrh120l_zone1_cool_min = body[KJRH120L_ZONE1_COOL_MIN_INDEX]
+    if body_len > KJRH120L_OUTDOOR_TEMP_INDEX:
+        raw_t4 = body[KJRH120L_OUTDOOR_TEMP_INDEX]
+        if raw_t4 != 0xFF:
+            t4 = raw_t4 - KJRH120L_OUTDOOR_TEMP_OFFSET
+            if KJRH120L_OUTDOOR_TEMP_MIN <= t4 <= KJRH120L_OUTDOOR_TEMP_MAX:
+                status.kjrh120l_outdoor_temp = float(t4)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +687,107 @@ def build_kjrh120l_set_temperature(temp: int) -> str:
     49 → ``00070131ff`` (confirmed captures). No checksum; the cloud frames it.
     """
     return "000701%02xff" % temp
+
+
+# Zone 1 writes, from the iOS app capture (2026-11-12, Zone 1 power 2026-11-14),
+# all acked with code 0:
+#   field 0x04 Zone 1 setpoint  00040133ff (51), 0004013fff (63), 00040132ff (50)
+#   field 0x03 run mode         00030102ff00040132ff (cool), 00030103ff00040132ff
+#                               (heat); the app always sends the Zone 1 setpoint
+#                               right after the mode
+#   field 0x00 Zone 1 power     00000101ff on, 00000100ff off
+KJRH120L_ZONE1_POWER_ON = "00000101ff"
+KJRH120L_ZONE1_POWER_OFF = "00000100ff"
+_KJRH120L_CAPTURED_RUN_MODES = (KJRH120L_RUN_MODE_HEAT, KJRH120L_RUN_MODE_COOL)
+
+
+def _kjrh120l_byte(value: object, what: str) -> int:
+    """Return ``value`` if it is an int that fits in one byte, else raise."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFF:
+        raise ValueError(f"KJRH-120L {what} must be an integer 0-255, got {value!r}")
+    return value
+
+
+def build_kjrh120l_zone1_setpoint(temp: int) -> str:
+    """Return the Zone 1 setpoint write ``0004 01 <temp> ff``."""
+    return "000401%02xff" % _kjrh120l_byte(temp, "Zone 1 setpoint")
+
+
+def build_kjrh120l_run_mode(run_mode: int, zone1_setpoint: int) -> str:
+    """Return the run mode write paired with the Zone 1 setpoint.
+
+    Only the two captured codes are accepted (heat=3, cool=2). The Auto code
+    was never captured, so it cannot be sent. The setpoint must already be
+    valid for ``run_mode``; see ``kjrh120l_mode_change_setpoint``.
+    """
+    if isinstance(run_mode, bool) or run_mode not in _KJRH120L_CAPTURED_RUN_MODES:
+        raise ValueError(f"KJRH-120L run mode must be 2 or 3, got {run_mode!r}")
+    return ("000301%02xff" % run_mode) + build_kjrh120l_zone1_setpoint(zone1_setpoint)
+
+
+def build_kjrh120l_zone1_power(on: bool) -> str:
+    """Return the Zone 1 power write for ``on``."""
+    if not isinstance(on, bool):
+        raise ValueError(f"KJRH-120L Zone 1 power must be a bool, got {on!r}")
+    return KJRH120L_ZONE1_POWER_ON if on else KJRH120L_ZONE1_POWER_OFF
+
+
+def _kjrh120l_valid_range(low: object, high: object) -> tuple[int, int] | None:
+    """Return ``(low, high)`` when both are byte-sized finite ints and low < high."""
+    limits = []
+    for value in (low, high):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value) or value != int(value):
+            return None
+        if not 0 <= value <= 0xFF:
+            return None
+        limits.append(int(value))
+    if limits[0] >= limits[1]:
+        return None
+    return limits[0], limits[1]
+
+
+def kjrh120l_zone1_range(
+    status: ITSStatus, run_mode: int | None = None
+) -> tuple[int, int] | None:
+    """Return the device-reported Zone 1 ``(min, max)`` for ``run_mode``.
+
+    ``run_mode`` defaults to the mode in ``status``. None when the mode is not
+    heat or cool or the reported limits are missing or malformed. There is no
+    fallback range.
+    """
+    if run_mode is None:
+        run_mode = status.kjrh120l_run_mode
+    if run_mode == KJRH120L_RUN_MODE_HEAT:
+        return _kjrh120l_valid_range(
+            status.kjrh120l_zone1_heat_min, status.kjrh120l_zone1_heat_max
+        )
+    if run_mode == KJRH120L_RUN_MODE_COOL:
+        return _kjrh120l_valid_range(
+            status.kjrh120l_zone1_cool_min, status.kjrh120l_zone1_cool_max
+        )
+    return None
+
+
+def kjrh120l_mode_change_setpoint(status: ITSStatus, run_mode: int) -> int:
+    """Return the Zone 1 setpoint to pair with a switch to ``run_mode``.
+
+    The app sends the mode and the Zone 1 setpoint together. Sending the
+    current setpoint unchanged would put a heating target into Cool (50 with a
+    5-25 cool range), so the current setpoint is clamped into the destination
+    range. Raises ValueError when the setpoint or that range is unavailable.
+    """
+    if run_mode not in _KJRH120L_CAPTURED_RUN_MODES:
+        raise ValueError(f"KJRH-120L run mode must be 2 or 3, got {run_mode!r}")
+    limits = kjrh120l_zone1_range(status, run_mode)
+    if limits is None:
+        raise ValueError("The device has not reported a valid Zone 1 range for that mode")
+    current = status.kjrh120l_zone1_setpoint
+    if current is None or not math.isfinite(current):
+        raise ValueError("The device has not reported a Zone 1 setpoint")
+    low, high = limits
+    return max(low, min(int(current), high))
 
 
 def apply_profile_to_status(profile: ModelProfile, status: ITSStatus) -> ITSStatus:
@@ -476,35 +831,84 @@ def apply_profile_to_sensors(
       decode would produce (issues #21 / #5).
     """
     if profile is ModelProfile.KJRH120L:
-        return dataclasses.replace(sensors, **_KJRH120L_SUPPRESSED_TEMPS)
+        overrides: dict[str, Any] = dict(_KJRH120L_SUPPRESSED_TEMPS)
+        if status is not None and status.kjrh120l_outdoor_temp is not None:
+            overrides["t4_temp"] = status.kjrh120l_outdoor_temp
+        return dataclasses.replace(sensors, **overrides)
     if profile in (ModelProfile.ATW, ModelProfile.AQUAPURA):
         if profile is ModelProfile.ATW and atw_sensors_are_placeholder(
             sensors.raw_body,
         ):
-            sensors = dataclasses.replace(sensors, **_ATW_PLACEHOLDER_SENSOR_FIELDS)
+            placeholder_fields: dict[str, Any] = dict(_ATW_PLACEHOLDER_SENSOR_FIELDS)
+            sensors = dataclasses.replace(sensors, **placeholder_fields)
         if status is not None and status.box_bottom_temp is not None:
             return dataclasses.replace(sensors, th_temp=status.box_bottom_temp)
     return sensors
 
 
+def describe_profile_variant(
+    sn8: str | None,
+    status: ITSStatus | None,
+) -> str:
+    """Return a concise label for the resolved profile and structural variant.
+
+    Used by diagnostics (#166) so maintainers can see immediately which layout
+    branch matched a device's live frames without re-deriving it by hand.
+    """
+    profile = resolve_profile(sn8)
+    body = bytes(status.raw_body) if status is not None and status.raw_body else b""
+    if profile is ModelProfile.ATW:
+        if not body:
+            return "atw_unclassified"
+        if _is_27_byte_atw_status(body):
+            return "atw_27_byte"
+        if _is_rotenso_atw_status(body):
+            return "atw_rotenso_25_byte"
+        return f"atw_{len(body)}_byte"
+    if profile is ModelProfile.KJRH120L:
+        if not body:
+            return "kjrh120l_unclassified"
+        return "kjrh120l_dual" if kjrh120l_has_zone1(body) else "kjrh120l_pure_dhw"
+    if profile is ModelProfile.AQUAPURA:
+        return "aquapura"
+    return "standard"
+
+
 __all__ = [
     "AQUAPURA_SN8",
+    "ATW_HMI_PARAMS_MIN_LEN",
+    "ATW_HMI_PARAMS_SUBTYPE",
     "ATW_SN8",
+    "ATW_UNIT_PARAMS_MIN_LEN",
+    "ATW_UNIT_PARAMS_SUBTYPE",
     "KJRH120L_DHW_OFF",
     "KJRH120L_DHW_ON",
     "KJRH120L_DHW_TEMP_MAX",
     "KJRH120L_DHW_TEMP_MIN",
+    "KJRH120L_RUN_MODE_COOL",
+    "KJRH120L_RUN_MODE_HEAT",
     "KJRH120L_SN8",
     "KJRH120L_TEMP_MAX",
     "KJRH120L_TEMP_MIN",
+    "KJRH120L_ZONE1_POWER_OFF",
+    "KJRH120L_ZONE1_POWER_ON",
     "ModelProfile",
+    "apply_atw_hmi_params",
+    "apply_atw_unit_params",
     "apply_profile_to_sensors",
     "apply_profile_to_status",
+    "atw_c3_basic",
     "atw_sensors_are_placeholder",
+    "build_kjrh120l_run_mode",
     "build_kjrh120l_set_temperature",
+    "build_kjrh120l_zone1_power",
+    "build_kjrh120l_zone1_setpoint",
     "build_query_command",
     "decode_atw_status",
     "decode_kjrh120l_status",
+    "describe_profile_variant",
     "kjrh120l_has_zone1",
+    "kjrh120l_mode_change_setpoint",
+    "kjrh120l_zone1_range",
     "resolve_profile",
 ]

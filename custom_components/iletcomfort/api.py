@@ -6,39 +6,84 @@ library. Contains only the API client classes and protocol functions — no CLI 
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
 import logging
-import random as random_module
-import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
-import requests
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding as crypto_padding
+from .c3_frame import (
+    DEVICE_TYPE_C3,
+    SENSOR_DISCONNECTED,
+    TEMP_OFFSET,
+    _temp_offset,
+    build_c3_query,
+    build_c3_set,
+    extract_c3_body,
+    parse_hex_response,
+)
+from .cloud import (
+    API_BASE,
+    APP_ID,
+    APP_KEY,
+    APP_SECRET,
+    CLIENT_ID,
+    CLIENT_SECRET,
+    ENCRYPT_KEY,
+    IOT_KEY,
+    ApiError,
+    AppCert,
+    AuthError,
+    DollinCloudClient,
+    encrypt_password,
+    mask_identifier,
+    sign_v1,
+    sign_v2,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# App constants extracted from the iLetComfort iOS binary
-# ---------------------------------------------------------------------------
-APP_SECRET = "SIT_4VjZdg19laDoIrut"
-APP_KEY = "btri"
-IOT_KEY = "meicloud"
-CLIENT_ID = "d056337d77334ecc95aca4bff6025533"
-CLIENT_SECRET = "35b965531383ce9f37f829a19712bf3a"
-ENCRYPT_KEY = "4dbc9ff6c15944d78eebb581c2b23de3"
-APP_ID = "8010"
-API_BASE = "https://us.dollin.net"
-
-DEVICE_TYPE_C3 = 0xC3
-
-TEMP_OFFSET = 35
-SENSOR_DISCONNECTED = 204
+__all__ = [
+    "API_BASE",
+    "APP_ID",
+    "APP_KEY",
+    "APP_SECRET",
+    "CLIENT_ID",
+    "CLIENT_SECRET",
+    "DEVICE_TYPE_C3",
+    "ENCRYPT_KEY",
+    "IOT_KEY",
+    "MODE_COOL",
+    "MODE_HEAT",
+    "MODE_MAP",
+    "MODE_OFF",
+    "MODE_WATERPUMP",
+    "QUERY_TO_SET_MODE",
+    "SENSORS_MIN_BODY_LEN",
+    "SENSOR_DISCONNECTED",
+    "STATUS_MIN_BODY_LEN",
+    "STATUS_MODE_COOL",
+    "STATUS_MODE_HEAT",
+    "STATUS_MODE_OFF",
+    "TEMP_OFFSET",
+    "TEMP_RANGES",
+    "ApiError",
+    "AppCert",
+    "AuthError",
+    "DollinCloudClient",
+    "ILetComfortClient",
+    "ITSSensors",
+    "ITSStatus",
+    "_temp_offset",
+    "build_c3_query",
+    "build_c3_set",
+    "decode_its_sensors",
+    "decode_its_status",
+    "encrypt_password",
+    "extract_c3_body",
+    "mask_identifier",
+    "parse_hex_response",
+    "sign_v1",
+    "sign_v2",
+]
 
 # A substantive C3 query response body must be long enough for the decoder to
 # populate every field surfaced as an entity. Shorter bodies are echo-only /
@@ -60,6 +105,12 @@ MODE_OFF = 0x00
 MODE_HEAT = 0x01
 MODE_COOL = 0x03
 MODE_WATERPUMP = 0x04
+
+# Status-frame (query response) mode values. Note these differ from the SET
+# modes above: Cool is 3 in a SET frame but 2 in a status frame.
+STATUS_MODE_OFF = 0
+STATUS_MODE_HEAT = 1
+STATUS_MODE_COOL = 2
 MODE_MAP: dict[str, int] = {
     "off": MODE_OFF,
     "heat": MODE_HEAT,
@@ -81,163 +132,6 @@ QUERY_TO_SET_MODE: dict[int, int] = {
     2: MODE_COOL,
     4: MODE_WATERPUMP,
 }
-
-
-# ---------------------------------------------------------------------------
-# Privacy helpers
-# ---------------------------------------------------------------------------
-
-def mask_identifier(value: str | None, *, keep: int = 5) -> str:
-    """Suffix-mask a device identifier for safe display/logging.
-
-    Keeps the first ``keep`` characters and replaces the remainder with ``…`` so
-    a value can still be loosely correlated without exposing the full ID. Short
-    or empty values are fully masked.
-    """
-    if not value:
-        return ""
-    if len(value) <= keep:
-        return "…"
-    return value[:keep] + "…"
-
-
-# ---------------------------------------------------------------------------
-# Signing algorithms
-# ---------------------------------------------------------------------------
-
-def sign_v1(json_body: str, *, use_iot_key: bool = False) -> tuple[str, str]:
-    """Compute the v1 API signature."""
-    timestamp_fmt = time.strftime("%Y%m%d%H%M%S")
-    random_suffix = str(random_module.randint(0, 65535))
-    random_value = timestamp_fmt + random_suffix
-
-    prefix = IOT_KEY if use_iot_key else APP_KEY
-    message = prefix + json_body + random_value
-    signature = hmac.new(
-        APP_SECRET.encode("ascii"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    return signature, random_value
-
-
-def encrypt_password(plaintext_password: str) -> str:
-    """Encrypt a plaintext password for the Dollin v1 login API."""
-    password_hash_hex = hashlib.sha256(plaintext_password.encode("utf-8")).hexdigest()
-
-    key_material = hashlib.sha256(ENCRYPT_KEY.encode("utf-8")).hexdigest()
-    aes_key = key_material[0:16].encode("ascii")
-    aes_iv = key_material[16:32].encode("ascii")
-
-    padder = crypto_padding.PKCS7(128).padder()
-    padded_data = padder.update(password_hash_hex.encode("utf-8")) + padder.finalize()
-
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(aes_iv))
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
-
-    return ciphertext.hex()
-
-
-def sign_v2(method: str, path: str, body: str) -> str:
-    """Compute the v2.0 business API signature."""
-    message = method + path + body
-    sig_bytes = hmac.new(
-        CLIENT_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    return base64.b64encode(sig_bytes).decode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# C3 heat pump protocol -- frame construction
-# ---------------------------------------------------------------------------
-
-def build_c3_query(subtype: int) -> str:
-    """Build a C3 query command frame."""
-    header = [
-        0xAA, 0x00, DEVICE_TYPE_C3,
-        0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03,
-    ]
-    body = [subtype]
-    header[1] = len(header) + len(body)
-    frame = header + body
-    checksum = (~sum(frame[1:]) + 1) & 0xFF
-    frame.append(checksum)
-    return bytes(frame).hex()
-
-
-def build_c3_set(
-    mode: int,
-    temperature: int,
-    status_body: bytearray,
-    mute_level: int = 0,
-    ctrl_flag: int = 0,
-) -> str:
-    """Build a C3 SET command frame (62 bytes)."""
-    d = 1
-    frame = bytearray(62)
-
-    frame[0] = 0xAA
-    frame[1] = 0x3D
-    frame[2] = DEVICE_TYPE_C3
-    frame[9] = 0x02
-    frame[10] = 0x01
-    frame[11] = 0x01
-    frame[12] = mode
-    frame[13] = temperature + TEMP_OFFSET
-
-    if len(status_body) > d + 18:
-        frame[14] = status_body[d + 4]
-        frame[15] = status_body[d + 5]
-        frame[16] = status_body[d + 6]
-        frame[18] = status_body[d + 8]
-        frame[19] = status_body[d + 9]
-        frame[23] = status_body[d + 13]
-        frame[28] = status_body[d + 18]
-
-    frame[25] = mute_level
-    frame[26] = ctrl_flag
-    frame[61] = (~sum(frame[1:61]) + 1) & 0xFF
-
-    return frame.hex()
-
-
-# ---------------------------------------------------------------------------
-# C3 response parsing
-# ---------------------------------------------------------------------------
-
-def parse_hex_response(hex_data: str) -> bytearray:
-    """Parse a hex response string into bytes."""
-    hex_data = hex_data.strip()
-    if "," in hex_data:
-        return bytearray(int(x.strip(), 16) for x in hex_data.split(","))
-    return bytearray(bytes.fromhex(hex_data))
-
-
-def extract_c3_body(raw: bytearray) -> tuple[int, bytearray]:
-    """Extract the body from a C3 response frame."""
-    if len(raw) < 12:
-        raise ValueError(f"Response too short: {len(raw)} bytes")
-    if raw[0] != 0xAA:
-        raise ValueError(f"Invalid header byte: 0x{raw[0]:02x}")
-    if raw[2] != DEVICE_TYPE_C3:
-        raise ValueError(f"Not a C3 device response: 0x{raw[2]:02x}")
-
-    body = raw[10:-1]
-    body_type = body[0] if body else 0
-    return body_type, body
-
-
-def _temp_offset(raw_byte: int) -> float | None:
-    """Decode a temperature byte using the ITS +35 offset encoding."""
-    value = raw_byte - TEMP_OFFSET
-    if value == SENSOR_DISCONNECTED:
-        return None
-    return float(value)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +188,20 @@ class ITSStatus:
     fan_total_run_hours: int = 0
     # KJRH-120L dual variant's separate DHW target (status body[15], issue #5).
     kjrh120l_dhw_setpoint: float | None = None
+    # KJRH-120L Zone 1 fields from the subtype 0x01 body, decoded on every
+    # KJRH-120L frame regardless of body[8:10] (app capture 2026-11-12/14).
+    kjrh120l_zone1_power: bool | None = None  # body[8]
+    kjrh120l_run_mode: int | None = None  # body[11], heat=3, cool=2
+    kjrh120l_zone1_setpoint: float | None = None  # body[12]
+    kjrh120l_zone1_heat_max: int | None = None  # body[37]
+    kjrh120l_zone1_heat_min: int | None = None  # body[38]
+    kjrh120l_zone1_cool_max: int | None = None  # body[39]
+    kjrh120l_zone1_cool_min: int | None = None  # body[40]
+    # KJRH-120L outdoor ambient temp (status body[57] - 196; #148/#142/#136/#119).
+    kjrh120l_outdoor_temp: float | None = None
+    # Standard Midea C3 basic status (``c3_basic.C3BasicStatus``) when an ATW
+    # (sn8 171H120F) status frame matches that layout; None otherwise.
+    c3_basic: Any = None
     raw_body: bytes = field(default_factory=bytes, repr=False)
 
 
@@ -392,9 +300,9 @@ class ITSSensors:
     online_num: int = 0
     odu_mac_type: int = 0
     limit_frq_code: int = 0
-    tf_temp: int = 0
-    tp_temp: int = 0
-    th_temp: int = 0
+    tf_temp: float | None = 0
+    tp_temp: float | None = 0
+    th_temp: float | None = 0
     water_pres: int = 0
     water_flow: int = 0
     capacity_hp: int = 0
@@ -405,8 +313,8 @@ class ITSSensors:
     twin_temp: float | None = None
     twout_temp: float | None = None
     t1_temp: float | None = None
-    odu_current: float = 0.0
-    odu_voltage: int = 0
+    odu_current: float | None = 0.0
+    odu_voltage: int | None = 0
     dc_current: int = 0
     idu_version: str = ""
     odu_version: str = ""
@@ -495,217 +403,18 @@ def decode_its_sensors(body: bytearray) -> ITSSensors:
 
 
 # ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-class AuthError(Exception):
-    """Authentication or authorization error."""
-
-
-class ApiError(Exception):
-    """API request error."""
-
-
-# ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
 
-@dataclass
-class AppCert:
-    """An app-issued client certificate for the vendor's AWS IoT MQTT broker.
 
-    Minted per session-independent of the account token, so MQTT push keeps
-    working while the phone app holds the single active account session (the
-    login-war fix, see issue #55). ``private_key`` is secret and is kept out of
-    ``repr`` so it never lands in logs.
-    """
+class ILetComfortClient(DollinCloudClient):
+    """Client for the iLetComfort / Midea Dollin cloud API (C3 protocol layer)."""
 
-    private_key: str = field(repr=False)
-    certificate_pem: str = field(repr=False)
-    endpoint: str
-    port: int
-
-
-class ILetComfortClient:
-    """Client for the iLetComfort / Midea Dollin cloud API."""
-
-    def __init__(
-        self,
-        api_base: str = API_BASE,
-        access_token: str | None = None,
-        timeout: int = 15,
-    ) -> None:
-        self._api_base = api_base.rstrip("/")
-        self._access_token = access_token
-        self._timeout = timeout
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
         # Optional LAN transport (see local.py). When set, send_hex_command
         # bypasses the cloud; login/list_appliances still use the cloud.
         self.local_transport: Any = None
-        self._session = requests.Session()
-        self._session.headers.update({
-            "Content-Type": "application/json",
-            "User-Agent": (
-                "iLetComfort/1.6.4 (com.btri.OEMPlus; build:308; iOS 26.3.0) "
-                "Alamofire/5.5.0"
-            ),
-            "language": "en_US",
-        })
-
-    @property
-    def access_token(self) -> str | None:
-        return self._access_token
-
-    @access_token.setter
-    def access_token(self, value: str | None) -> None:
-        self._access_token = value
-
-    def _v1_request(
-        self, path: str, body_dict: dict[str, Any], *,
-        use_iot_key: bool = False,
-        include_access_token: bool = False,
-    ) -> dict[str, Any]:
-        """Send a v1 API request with Scheme 1 signing.
-
-        Some v1 endpoints (e.g. the app-certificate mint used for MQTT push) are
-        additionally gated on a bearer-style ``accessToken`` header on top of the
-        iot-key signing; set ``include_access_token`` for those.
-        """
-        url = self._api_base + path
-        json_body = json.dumps(body_dict, separators=(",", ":"))
-        sign_hex, random_value = sign_v1(json_body, use_iot_key=use_iot_key)
-
-        stamp = time.strftime("%Y%m%d%H%M%S")
-
-        headers = {
-            "random": random_value,
-            "src": "20",
-            "appid": APP_ID,
-            "language": "en_US",
-            "clienttype": "2",
-            "appvnum": "1.6.4",
-            "stamp": stamp,
-            "deviceid": hashlib.sha256(
-                f"iletcomfort-py-{int(time.time())}".encode()
-            ).hexdigest()[:32].upper(),
-            "sign": sign_hex,
-            "reqid": hashlib.md5(
-                f"{time.time()}-{random_module.random()}".encode()
-            ).hexdigest(),
-        }
-
-        if include_access_token:
-            headers["accessToken"] = self._access_token or ""
-
-        response = self._session.post(
-            url, data=json_body, headers=headers, timeout=self._timeout,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def _v2_request(self, path: str, body_dict: dict[str, Any]) -> dict[str, Any]:
-        """Send a v2.0 business API request with Scheme 2 signing."""
-        if not self._access_token:
-            raise AuthError("No access token available.")
-
-        url = self._api_base + path
-        json_body = json.dumps(body_dict, separators=(",", ":"))
-        signature = sign_v2("POST", path, json_body)
-
-        headers = {
-            "authorization": f"Bearer {self._access_token}",
-            "clientId": CLIENT_ID,
-            "signature": signature,
-            "signatureversion": "2.0",
-            "reqid": hashlib.md5(
-                f"{time.time()}-{random_module.random()}".encode()
-            ).hexdigest(),
-        }
-
-        response = self._session.post(
-            url, data=json_body, headers=headers, timeout=self._timeout,
-        )
-        response.raise_for_status()
-        result = response.json()
-
-        code = result.get("code")
-        if code in (14005, 12001):
-            raise AuthError("Access token expired or invalid.")
-
-        return result
-
-    # -- Token persistence --
-
-    def save_token(self, filepath: Path | None = None) -> None:
-        """Save the access token to a JSON file."""
-        if filepath is None:
-            return
-        data: dict[str, Any] = {}
-        if filepath.exists():
-            try:
-                data = json.loads(filepath.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-        data["access_token"] = self._access_token
-        data["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-        filepath.write_text(
-            json.dumps(data, indent=2) + "\n", encoding="utf-8",
-        )
-
-    def load_token(self, filepath: Path | None = None) -> bool:
-        """Load access token from a saved file."""
-        if filepath is None or not filepath.exists():
-            return False
-        try:
-            data = json.loads(filepath.read_text(encoding="utf-8"))
-            token = data.get("access_token")
-            if token:
-                self._access_token = token
-                return True
-        except (json.JSONDecodeError, OSError, KeyError):
-            pass
-        return False
-
-    # -- Public API methods --
-
-    def login(
-        self, account: str, password: str, *, pre_encrypted: bool = False,
-    ) -> dict[str, Any]:
-        """Authenticate with the Dollin cloud."""
-        encrypted_pw = password if pre_encrypted else encrypt_password(password)
-
-        body = {
-            "loginAccount": account,
-            "password": encrypted_pw,
-            "encryptVersion": "1",
-        }
-
-        result = self._v1_request("/v1/user/login", body, use_iot_key=True)
-
-        if result.get("code") == 0 and "data" in result:
-            self._access_token = result["data"]["accessToken"]
-            return result["data"]
-
-        # Codes in the 14xxx range are account/auth-related (wrong password,
-        # locked account, expired token, …). Everything else is an API-side
-        # failure (signature/region/transport-shaped errors).
-        code = result.get("code")
-        msg = f"Login failed: code={code}, msg={result.get('msg')}"
-        if isinstance(code, int) and 14000 <= code < 15000:
-            raise AuthError(msg)
-        raise ApiError(msg)
-
-    def list_appliances(self) -> list[dict[str, Any]]:
-        """List all appliances linked to the account."""
-        result = self._v2_request(
-            "/midea/open/business/v1/appliance/list",
-            {"queryAuth": True},
-        )
-        if result.get("code") == 0:
-            return result.get("data", [])
-        raise ApiError(
-            f"List appliances failed: code={result.get('code')}, "
-            f"msg={result.get('msg')}"
-        )
 
     def send_hex_command(
         self, appliance_code: str, command_hex: str,
@@ -718,46 +427,7 @@ class ILetComfortClient:
         """
         if self.local_transport is not None:
             return self.local_transport.send_hex_command(command_hex)
-        result = self._v2_request(
-            "/midea/open/business/v1/appliance/control/hexadecimal",
-            {
-                "applianceCode": appliance_code,
-                "command": command_hex,
-            },
-        )
-        if result.get("code") == 0:
-            return result.get("data", "")
-        raise ApiError(
-            f"Send command failed: code={result.get('code')}, "
-            f"msg={result.get('msg')}"
-        )
-
-    def create_app_cert(self) -> AppCert:
-        """Mint an app client certificate for the vendor's MQTT broker.
-
-        Returns the certificate/key pair plus the broker endpoint and port. The
-        endpoint is signed with the iot-key prefix and additionally gated on the
-        ``accessToken`` header (established against the live endpoint). The cert
-        authenticates independently of the account session (issue #55).
-        """
-        result = self._v1_request(
-            "/v1/certificate/create/app/cert",
-            {},
-            use_iot_key=True,
-            include_access_token=True,
-        )
-        if result.get("code") == 0 and isinstance(result.get("data"), dict):
-            data = result["data"]
-            return AppCert(
-                private_key=str(data["privateKey"]),
-                certificate_pem=str(data["certificatePem"]),
-                endpoint=str(data["endpoint"]),
-                port=int(data["port"]),
-            )
-        raise ApiError(
-            f"Certificate request failed: code={result.get('code')}, "
-            f"msg={result.get('msg')}"
-        )
+        return super().send_hex_command(appliance_code, command_hex)
 
     def query_status(
         self, appliance_code: str, sn8: str | None = None,
@@ -774,15 +444,11 @@ class ILetComfortClient:
         ``ffff<ss><ss><ss>ff`` form, so the command is built via
         ``build_query_command``. Other profiles keep the standard frame.
         """
-        # Imported lazily to avoid a circular import (model_profiles imports api).
-        from .model_profiles import (
-            apply_profile_to_status,
-            build_query_command,
-            resolve_profile,
-        )
+        # Imported lazily to avoid a circular import (protocols imports api).
+        from .protocols import get_adapter
 
-        profile = resolve_profile(sn8)
-        command = build_query_command(profile, 0x01)
+        adapter = get_adapter(sn8)
+        command = adapter.build_query(0x01)
         response_hex = self.send_hex_command(appliance_code, command)
         _LOGGER.debug("query_status raw response: %s", response_hex)
         raw = parse_hex_response(response_hex)
@@ -794,7 +460,7 @@ class ILetComfortClient:
                 f"unsupported. Raw: {response_hex}"
             )
         status = decode_its_status(body)
-        return apply_profile_to_status(profile, status)
+        return adapter.decode_status(status)
 
     def query_sensors(
         self, appliance_code: str, sn8: str | None = None,
@@ -805,10 +471,10 @@ class ILetComfortClient:
         rejects the standard long C3 query frame (code 1214) and needs a short
         ``ffff<ss><ss><ss>ff`` form. Unknown/None sn8 uses the standard frame.
         """
-        # Imported lazily to avoid a circular import (model_profiles imports api).
-        from .model_profiles import build_query_command, resolve_profile
+        # Imported lazily to avoid a circular import (protocols imports api).
+        from .protocols import get_adapter
 
-        command = build_query_command(resolve_profile(sn8), 0x02)
+        command = get_adapter(sn8).build_query(0x02)
         response_hex = self.send_hex_command(appliance_code, command)
         _LOGGER.debug("query_sensors raw response: %s", response_hex)
         raw = parse_hex_response(response_hex)
@@ -820,6 +486,38 @@ class ILetComfortClient:
                 f"unsupported. Raw: {response_hex}"
             )
         return decode_its_sensors(body)
+
+    def query_atw_unit_params(self, appliance_code: str) -> bytes:
+        """Query ATW subtype 0x10 unit parameters for live telemetry (#120)."""
+        from .model_profiles import ATW_UNIT_PARAMS_MIN_LEN, ATW_UNIT_PARAMS_SUBTYPE
+
+        command = build_c3_query(ATW_UNIT_PARAMS_SUBTYPE)
+        response_hex = self.send_hex_command(appliance_code, command)
+        _LOGGER.debug("query_atw_unit_params raw response: %s", response_hex)
+        raw = parse_hex_response(response_hex)
+        body_type, body = extract_c3_body(raw)
+        if body_type != ATW_UNIT_PARAMS_SUBTYPE or len(body) < ATW_UNIT_PARAMS_MIN_LEN:
+            raise ApiError(
+                f"ATW unit_params (0x10) returned unexpected or truncated frame "
+                f"(type=0x{body_type:02x}, {len(body)} body bytes)"
+            )
+        return bytes(body)
+
+    def query_atw_hmi_params(self, appliance_code: str) -> bytes:
+        """Query ATW subtype 0x0A HMI parameters for compressor run hours (#120)."""
+        from .model_profiles import ATW_HMI_PARAMS_MIN_LEN, ATW_HMI_PARAMS_SUBTYPE
+
+        command = build_c3_query(ATW_HMI_PARAMS_SUBTYPE)
+        response_hex = self.send_hex_command(appliance_code, command)
+        _LOGGER.debug("query_atw_hmi_params raw response: %s", response_hex)
+        raw = parse_hex_response(response_hex)
+        body_type, body = extract_c3_body(raw)
+        if body_type != ATW_HMI_PARAMS_SUBTYPE or len(body) < ATW_HMI_PARAMS_MIN_LEN:
+            raise ApiError(
+                f"ATW hmi_params (0x0A) returned unexpected or truncated frame "
+                f"(type=0x{body_type:02x}, {len(body)} body bytes)"
+            )
+        return bytes(body)
 
     def set_device(
         self,
@@ -833,6 +531,9 @@ class ILetComfortClient:
         mute_level: int | None = None,
         power_on: bool = False,
         last_on_state: tuple[int, int] | None = None,
+        zone1_temperature: int | None = None,
+        zone1_run_mode: int | None = None,
+        zone1_power: bool | None = None,
     ) -> dict[str, Any]:
         """Send a SET command to the heat pump.
 
@@ -843,6 +544,9 @@ class ILetComfortClient:
         build_c3_set path unchanged: query current status for echo bytes, merge
         the requested changes, validate temperature ranges, build and send the
         SET frame.
+
+        ``zone1_temperature``, ``zone1_run_mode`` and ``zone1_power`` exist only
+        for the KJRH-120L. Any other sn8 raises ApiError before anything is sent.
         """
         # Imported lazily to avoid a circular import (model_profiles imports api).
         from .model_profiles import ModelProfile, resolve_profile
@@ -853,6 +557,17 @@ class ILetComfortClient:
                 mode=mode,
                 temperature=temperature,
                 power_on=power_on,
+                zone1_temperature=zone1_temperature,
+                zone1_run_mode=zone1_run_mode,
+                zone1_power=zone1_power,
+            )
+        if any(
+            value is not None
+            for value in (zone1_temperature, zone1_run_mode, zone1_power)
+        ):
+            raise ApiError(
+                "Zone 1 setpoint, run mode and Zone 1 power writes are only "
+                "supported on the KJRH-120L (sn8 17100003)"
             )
 
         # Query current status for echo bytes
@@ -945,6 +660,9 @@ class ILetComfortClient:
         mode: int | None,
         temperature: int | None,
         power_on: bool,
+        zone1_temperature: int | None = None,
+        zone1_run_mode: int | None = None,
+        zone1_power: bool | None = None,
     ) -> dict[str, Any]:
         """Send a KJRH-120L (sn8 17100003) control command (issue #35).
 
@@ -953,16 +671,57 @@ class ILetComfortClient:
           - temperature → DHW setpoint write (``0007 01 <temp> ff``)
           - power_on / mode→heat → DHW power ON (``00020101ff``)
           - mode→off → DHW power OFF (``00020100ff``)
+          - zone1_temperature → Zone 1 setpoint (``0004 01 <temp> ff``)
+          - zone1_run_mode + zone1_temperature → run mode paired with the
+            Zone 1 setpoint, as the app sends it
+          - zone1_power → Zone 1 power (``0000 01 <0|1> ff``)
 
         The caller (climate entity) has already clamped ``temperature`` to the
         DHW range. Temperature takes priority over a same-call mode change.
+        A Zone 1 write cannot be combined with any other write; the frame
+        builders reject values that do not fit the captured shape.
         """
         # Imported lazily to avoid a circular import (model_profiles imports api).
         from .model_profiles import (
             KJRH120L_DHW_OFF,
             KJRH120L_DHW_ON,
+            build_kjrh120l_run_mode,
             build_kjrh120l_set_temperature,
+            build_kjrh120l_zone1_power,
+            build_kjrh120l_zone1_setpoint,
         )
+
+        effective: dict[str, Any]
+        if any(v is not None for v in (zone1_temperature, zone1_run_mode, zone1_power)):
+            if temperature is not None or mode is not None or power_on:
+                raise ValueError(
+                    "A KJRH-120L Zone 1 write cannot be combined with a DHW write"
+                )
+            if zone1_power is not None:
+                if zone1_temperature is not None or zone1_run_mode is not None:
+                    raise ValueError(
+                        "KJRH-120L Zone 1 power is a separate write from the "
+                        "setpoint and run mode"
+                    )
+                command = build_kjrh120l_zone1_power(zone1_power)
+                effective = {"effective_zone1_power": zone1_power}
+            elif zone1_run_mode is not None:
+                if zone1_temperature is None:
+                    raise ValueError(
+                        "A KJRH-120L run mode write needs the Zone 1 setpoint "
+                        "for the destination mode"
+                    )
+                command = build_kjrh120l_run_mode(zone1_run_mode, zone1_temperature)
+                effective = {
+                    "effective_run_mode": zone1_run_mode,
+                    "effective_zone1_temp": zone1_temperature,
+                }
+            else:
+                assert zone1_temperature is not None
+                command = build_kjrh120l_zone1_setpoint(zone1_temperature)
+                effective = {"effective_zone1_temp": zone1_temperature}
+            response_hex = self.send_hex_command(appliance_code, command)
+            return {"sent": command, "response": response_hex, **effective}
 
         if temperature is not None:
             command = build_kjrh120l_set_temperature(int(temperature))

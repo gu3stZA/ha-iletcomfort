@@ -13,12 +13,14 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    EntityCategory,
+    UnitOfElectricCurrent,
+    UnitOfElectricPotential,
     UnitOfEnergy,
     UnitOfFrequency,
     UnitOfTemperature,
     UnitOfTime,
-    UnitOfElectricCurrent,
-    UnitOfElectricPotential,
+    UnitOfVolumeFlowRate,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -50,6 +52,36 @@ def _st(attr: str) -> Callable[[dict[str, Any]], Any]:
     def _get(data: dict[str, Any]) -> Any:
         status = data.get("status")
         return getattr(status, attr, None) if status else None
+    return _get
+
+
+def _has_atw_0x10(data: dict[str, Any]) -> bool:
+    """Return True when live ATW subtype 0x10 telemetry populated this snapshot."""
+    raw_frames = data.get("raw_frames")
+    if isinstance(raw_frames, dict):
+        return 0x10 in raw_frames
+    sensors = data.get("sensors")
+    raw_body = getattr(sensors, "raw_body", b"") if sensors is not None else b""
+    return bytes(raw_body)[:1] == b"\x10"
+
+
+def _atw_0x10_s(attr: str) -> Callable[[dict[str, Any]], Any]:
+    """Read a sensor field only when ATW 0x10 telemetry is present."""
+    def _get(data: dict[str, Any]) -> Any:
+        if not _has_atw_0x10(data):
+            return None
+        sensors = data.get("sensors")
+        return getattr(sensors, attr, None) if sensors is not None else None
+    return _get
+
+
+def _atw_0x10_st(attr: str) -> Callable[[dict[str, Any]], Any]:
+    """Read a status field only when ATW 0x10 telemetry is present."""
+    def _get(data: dict[str, Any]) -> Any:
+        if not _has_atw_0x10(data):
+            return None
+        status = data.get("status")
+        return getattr(status, attr, None) if status is not None else None
     return _get
 
 
@@ -181,6 +213,54 @@ SENSOR_DESCRIPTIONS: tuple[ILetComfortSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=1,
         value_fn=_s("odu_current"),
+    ),
+    # Extended telemetry populated by ATW subtype 0x10 (verified on NØRDIS #120
+    # and Airwell #139). Disabled by default so models without 0x10 do not gain
+    # noisy zero entities (#169).
+    ILetComfortSensorDescription(
+        key="water_flow",
+        name="Water Flow",
+        native_unit_of_measurement=UnitOfVolumeFlowRate.CUBIC_METERS_PER_HOUR,
+        device_class=SensorDeviceClass.VOLUME_FLOW_RATE,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        entity_registry_enabled_default=False,
+        value_fn=lambda data: (
+            round(flow / 100.0, 2)
+            if _has_atw_0x10(data)
+            and (sensors := data.get("sensors")) is not None
+            and (flow := getattr(sensors, "water_flow", None)) is not None
+            else None
+        ),
+    ),
+    ILetComfortSensorDescription(
+        key="dc_voltage",
+        name="DC Bus Voltage",
+        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
+        device_class=SensorDeviceClass.VOLTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=_atw_0x10_s("dc_voltage"),
+    ),
+    ILetComfortSensorDescription(
+        key="dc_current",
+        name="DC Current",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=_atw_0x10_s("dc_current"),
+    ),
+    ILetComfortSensorDescription(
+        key="exv_steps",
+        name="Expansion Valve Opening",
+        icon="mdi:valve",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+        value_fn=_atw_0x10_st("exv_drg"),
     ),
 )
 

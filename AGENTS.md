@@ -129,7 +129,9 @@ Status `raw_body` (0-indexed; STANDARD misreads this 25-byte frame):
   in Galmet's 75-byte shape with non-zero group payloads that read like `hh,00,hh,00` time slots — the
   app's live water/outdoor values appear nowhere in it. `atw_sensors_are_placeholder` therefore matches
   the structure: `02,00`, then only `03,<c>,x,x,x,x` groups sharing one `c` (≥ 6 groups, at most a
-  single `00` between groups).
+  single `00` between groups), plus the 38-byte active-schedule form (#128 Airwell Wellea M, #150
+  Sinclair MSH-100IB-3/9) with a 6-bit enable mask in `body[1]` and six `[03|05, temp, sh, sm, eh, em]`
+  slots carrying valid `HH:MM` clock bytes and uniform `03,<c>` idle slots.
 - **27-byte status variant (#38 Galmet Prima 8GT, #132 NØRDIS Optimus Pro):** the same `sn8` also
   emits a 27-byte status layout. Galmet ends `e0,03,03`; two NØRDIS units end `60,04,03` and `40,05,00`
   and differ at `body[2]` (`0x15`/`0x17`). The shared signature is length 27 with
@@ -145,14 +147,69 @@ Status `raw_body` (0-indexed; STANDARD misreads this 25-byte frame):
   frames were otherwise identical, so compressor running state and frequency are unavailable—never
   infer them from this bit or report false/0.
 
-### KJRH-120L dual variant (`sn8 17100003`, #5) — hardware-validated reads
+### `171H120F` frames match the standard Midea C3 basic body (`c3_basic.py`)
+- Every `171H120F` status capture so far (Italtherm #22, Galmet #38, Rotenso Aquami #124 and a second
+  Rotenso) is laid out like midea-local's `C3BasicBody` (`data_offset=1`): `[1]` power/flags (zone1
+  `0x01`, zone2 `0x02`, DHW `0x04`, zone1 curve `0x08`, TBH `0x20`, fast DHW `0x40`), `[2]`
+  capabilities (`0x10` = zone1 water-temperature control), `[3]` silent `0x02` / ECO `0x08`, `[4]`
+  mode (3 heat, 2 cool), `[6]` zone1 water target, `[7]` zone2, `[8]` DHW target, `[9]` room target
+  ×2, `[10..21]` limits, `[22]` tank, `[23]` error. `decode_c3_basic` decodes the raw fields into
+  `ITSStatus.c3_basic`; `model_profiles.atw_c3_basic(sn8, status)` returns it only for the ATW profile.
+- **Rotenso layout (25 bytes, `[2]=0x15`):** `[1]` bit 0 is Zone-1 power — confirmed by the #124
+  reporter (heating on in the app) and on a second unit by switching Zone-1 from HA and seeing it in
+  the app. Decoded as Heat/Off, or Cool when `[4]` is Cool. Compressor state is unknown (`None`).
+- **Every other 25-byte mask** (Italtherm `0x07`, Kaisai #123 `0x11`, …): unchanged — `[1]` bit 0
+  stays space-heat demand, not Heat/Off, until validated on that hardware. The gate is the exact
+  Rotenso signature (`len == 25 and [2] == 0x15`), never "not Italtherm".
+- **Zone-1 setpoint is unresolved for the Rotenso layout.** The #124 reporter's app showed 24 °C =
+  `[9]/2` while `[6]` was 40; the second Rotenso's app shows 29 °C = `[6]` while `[9]/2` is 24. Both
+  frames carry `[2]=0x15` (water-temperature control) and `[9]/2` lies below the zone1 heat minimum
+  in both. Until corrected evidence or a validated discriminator exists, the climate keeps the
+  established `[9]/2` mapping; both candidates are exposed as the `zone1_water_target` /
+  `room_target` climate attributes so reporters can compare them with the app.
+- The DHW water-heater entity (`water_heater.py`) is added only after a status frame for an ATW unit
+  matched the layout (re-evaluated on coordinator updates, since `sn8` can be unknown at setup).
+- **Subtype `0x10` live telemetry (`v0.21.0`, #120 / #139 / #142):** `171H120F` firmware splits on
+  whether the Dollin cloud accepts a `0x10` query. Confirmed working on NØRDIS (#120) and Airwell
+  Wellea Split (#139: outdoor, water inlet/outlet, compressor frequency, ODU voltage, total energy,
+  condenser/evaporator/plate-HX/refrigerant temps, and high pressure in kPa). Rejected/unsupported
+  on Rotenso (#143) and Midea M-Thermal 16 kW (#142 `@blahavl`, 25-byte `[2]=0x11` with 38-byte
+  schedule template). `coordinator.py` probes `0x10` only when `0x02` is a placeholder and disables
+  it for the session after the first `ApiError` or invalid frame. Compressor total run hours are not
+  in `0x10`; they sit in subtype `0x0A` (`body[4..5]`, verified on NØRDIS #120) and are polled only
+  when `0x10` succeeds, with their own single-probe `ApiError` session disable.
+- **Airwell Wellea Split (`sn8 171H120F`, #139) controlled Silent/ECO test:** 27-byte status with
+  `body[2]=0x73`, `body[3]=0x90`, tail `e0,05,00` (does not match the `body[3:6] == a0,03,03`
+  Galmet/NØRDIS signature). Both Silent Level 1 and Super Silent (Level 2) set `body[3] & 0x02`
+  (`0x90 → 0x92`), confirming `0x01` only carries binary Silent ON/OFF (`super_silent_level` lives
+  in `0x05`). Enabling ECO left `body[3]=0x90` unchanged (do not assume `body[3] & 0x08` carries ECO
+  on all `171H120F` units).
+
+### KJRH-120L dual variant (`sn8 17100003`, #5 / #69) — hardware-validated reads & Zone-1 writes
 - The same `sn8` covers pure-DHW and Zone-1 + DHW controllers. Gate the dual layout only when status
   `body[8] == 1` and `body[9] == 1`; pure-DHW captures have `0/0`.
 - Dual layout: `body[12]` is the Zone-1 setpoint and `body[15]` is the DHW setpoint.
 - Zone-1 is read-only in the climate entity. A field `0x08` write was tested on hardware and always
   forced 23 °C, regardless of the requested value, so do **not** use it.
+- The app's Zone-1 setpoint write is field `0x04` (`00 04 01 <°C> ff`), confirmed by read-back. Run
+  mode is field `0x03` (heat 3, cool 2; paired with the Zone-1 setpoint clamped into the destination
+  mode's reported range) and Zone-1 power is field `0x00`. Implemented in PR #149 / v0.19.0 as
+  dedicated Zone-1 Target (`number`), Mode (`select`), and Zone-1 Power (`switch`) entities gated on
+  a latched `CONF_KJRH120L_ZONE1_CAPABLE` observation in `entry.data`; see
+  `docs/KJRH120L_CONTROL_PROTOCOL.md`.
+- Evidence limit on the gate above: on one dual unit, `body[8]`/`body[9]` follow the Zone-1/Zone-2
+  power state, not a fixed hardware marker. With Zone 1 switched off they read `0/0`, so the
+  unlatched `kjrh120l_has_zone1` check reads that unit as pure-DHW (the new Zone-1 entities use the
+  latched flag to stay available across off states and restarts). Whether the issue #5 pure-DHW
+  hardware lacks a zone is not known. See `docs/KJRH120L_SYSTEM_DECODE.md`.
 - DHW uses a separate Number entity and the confirmed short field `0x07` write. Pure-DHW keeps its
   existing climate behavior.
+- Outdoor ambient temperature (`t4_temp`) is decoded from `body[57] - 196` (v0.20.0, #156), live-
+  verified on v0.22.0 (#142 `@keramys`: `0xca` → 6.0 °C matching app 6 °C). In `@keramys`'s Normal vs
+  Silent Level 2 capture diff, `body[21]` and `body[31]` both flipped `0x00 → 0x01` (candidates
+  only; not decoded yet) while `body[49]` remained `0xdd` (tank temp remains unmapped). `@keramys`'s
+  working unit also reports `authStatus=0, activeStatus=0` in `appliance` metadata, so those zero
+  flags alone do not explain `code=1214` (relevant to #121).
 
 ### AQUAPURA profile (`sn8 171000AU`, AQS Energie split HPWH, #12; discriminator collision under audit)
 - The real water/tank temp is in `status.box_bottom_temp` (status byte[17], offset-decoded → e.g. 40 °C).
@@ -272,7 +329,10 @@ does not enforce per-appliance topic ACLs.
 | `api.py` | `ILetComfortClient` (login, `list_appliances`, `send_hex_command`, `query_status`/`query_sensors`); frame build/parse (`build_c3_query`, `build_c3_set`, `parse_hex_response`, `extract_c3_body`); decoders `decode_its_status`/`decode_its_sensors` + dataclasses `ITSStatus`/`ITSSensors`; `_temp_offset`; `AuthError`/`ApiError`. |
 | `error_codes.py` | Vendor C3 numeric `error_code` → panel code + description table; `sensor.py` exposes known entries as attributes while preserving the numeric sensor state. |
 | `scripts/fetch_plugin.py` | **Dev tool, not shipped** — fetches the vendor per-model plugin bundle (`0xC3` = Weex JS) via the `version:"0.0.0"` downgrade on `/v1/product/upgrade/plugin/get/latest`. Source of truth for the control **schema** (not bytes) — see §4. |
+| `scripts/c3_probe.py` | **Dev tool, not shipped, read-only** — sends C3 queries for `171H120F` units and decodes them (midea-local C3 layouts); reads only `ILET_EMAIL`/`ILET_PASSWORD`/`ILET_REGION` from `.env`. Cannot send SET frames. |
 | `model_profiles.py` | `ModelProfile` enum, `_SN8_PROFILES` table, `resolve_profile`, `decode_atw_status`, `apply_profile_to_status`, `apply_profile_to_sensors`. **Add new model support here.** |
+| `c3_basic.py` | Standard Midea C3 basic status decode (`decode_c3_basic`, `C3BasicStatus`) for `171H120F` frames. |
+| `water_heater.py` | DHW entity for ATW units whose status matches the C3 basic layout. |
 | `coordinator.py` | `ILetComfortCoordinator`: polling, re-auth, cache-fallback, offline Repair card. Caches `appliance_meta` (best-effort, never fatal) and exposes `sn8`; threads profile into decode. |
 | `diagnostics.py` | Redacted snapshot: raw frames, decoded status/sensors, `sensors_temperature_scan` (per-byte `_temp_offset` map — use it to find a model's misplaced temp byte), and the `appliance` metadata block. `APPLIANCE_TO_REDACT = {owner, sn, name}` (keeps `applianceType`/`modelNumber`/`sn8`). |
 | `climate.py` / `number.py` / `sensor.py` / `binary_sensor.py` / `switch.py` / `select.py` | HA entities. See §4 for which field backs which entity. |
@@ -305,8 +365,13 @@ does not enforce per-appliance topic ACLs.
   then merge. Repo **auto-merge is disabled**.
 - **Conventional Commits** required (PR title is checked). Squash-merge keeps the conventional message on
   `main`.
-- **TDD**: write failing tests first; run `pip install -r requirements_test.txt` then `python -m pytest -q`.
-  Never break the STANDARD-decode regression tests.
+- **TDD & local quality gates**: write failing tests first; run `pytest`, `ruff check .`, and
+  `mypy custom_components/iletcomfort/` locally before pushing. Never break the STANDARD-decode
+  regression tests or the entity-stability contract in `tests/test_hardware_corpus.py`.
+- **Mandatory clean-context self-review before PR**: before opening any PR, run an independent
+  code review of the full `git diff main...HEAD` in a **new subagent / clear context** to catch
+  edge cases, push/poll parity gaps, redaction leaks, and test gaps before they burn a human
+  review cycle.
 - Tooling preference: `rg` / `fd` / `bat` over `grep` / `find` / `cat`.
 - Distributed via **HACS**.
 

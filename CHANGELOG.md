@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.26.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.25.0...v0.26.0) (2026-11-26)
+
+
+### Features
+
+* add integration brand icon and enable full HACS validation ([#185](https://github.com/tgenov/ha-iletcomfort/issues/185)) ([f8f327f](https://github.com/tgenov/ha-iletcomfort/commit/f8f327f3439ebcd62e80164b857dfe9da8400f93))
+
+## [0.25.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.24.0...v0.25.0) (2026-11-26)
+
+
+### Features
+
+* **atw:** expose verified 0x10 sensors (water flow, DC bus, EXV) ([#178](https://github.com/tgenov/ha-iletcomfort/issues/178)) ([f0588d1](https://github.com/tgenov/ha-iletcomfort/commit/f0588d11fccf8388e9a47736f163db547480a6dd))
+
+
+### Bug Fixes
+
+* address EPIC [#173](https://github.com/tgenov/ha-iletcomfort/issues/173) code review findings and require clean-context self-review ([#184](https://github.com/tgenov/ha-iletcomfort/issues/184)) ([108e17b](https://github.com/tgenov/ha-iletcomfort/commit/108e17b58cdc853111666f3515e4070f88ae7ac8))
+
+## [0.24.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.23.0...v0.24.0) (2026-11-26)
+
+
+### Features
+
+* **diagnostics:** preserve raw frames per subtype and expose protocol probe state ([#174](https://github.com/tgenov/ha-iletcomfort/issues/174)) ([eeb767f](https://github.com/tgenov/ha-iletcomfort/commit/eeb767f3d39a7cb4c70ef720ca1031fe5aa94c8e))
+
+## [0.23.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.22.0...v0.23.0) (2026-11-26)
+
+
+### Features
+
+* **atw:** poll subtype 0x0A for compressor run hours ([#164](https://github.com/tgenov/ha-iletcomfort/issues/164)) ([7a4b257](https://github.com/tgenov/ha-iletcomfort/commit/7a4b257f519a1a4295b2bf56e26f747ef62b755f))
+
+## [0.22.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.21.0...v0.22.0) (2026-11-25)
+
+
+### Features
+
+* decode the C3 basic layout of 171H120F units ([#124](https://github.com/tgenov/ha-iletcomfort/issues/124)) ([#146](https://github.com/tgenov/ha-iletcomfort/issues/146)) ([cd3f759](https://github.com/tgenov/ha-iletcomfort/commit/cd3f759cbc8fcc70d5acf70f0c7661c37167066e))
+
+## [0.21.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.20.1...v0.21.0) (2026-11-25)
+
+
+### Features
+
+* **atw:** poll subtype 0x10 live telemetry when supported ([#160](https://github.com/tgenov/ha-iletcomfort/issues/160)) ([980eb6a](https://github.com/tgenov/ha-iletcomfort/commit/980eb6aecb4950bf79612f4a9c8632124c0994fc))
+
+## [0.20.1](https://github.com/tgenov/ha-iletcomfort/compare/v0.20.0...v0.20.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* **kjrh120l:** keep DHW setpoint and climate consistent when Zone 1 is off ([#158](https://github.com/tgenov/ha-iletcomfort/issues/158)) ([7e8924a](https://github.com/tgenov/ha-iletcomfort/commit/7e8924a4df7e224a165782a4e1596cbf54a81b92))
+
+## [0.20.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.19.1...v0.20.0) (2026-11-25)
+
+
+### Features
+
+* **kjrh120l:** decode outdoor temperature from status body[57] ([#156](https://github.com/tgenov/ha-iletcomfort/issues/156)) ([f9cf9a3](https://github.com/tgenov/ha-iletcomfort/commit/f9cf9a3d108ebafa06397b8b26229be78dc6b9e2))
+
+## [0.19.1](https://github.com/tgenov/ha-iletcomfort/compare/v0.19.0...v0.19.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* suppress ATW active schedule-slot sensor frames ([#153](https://github.com/tgenov/ha-iletcomfort/issues/153)) ([cca9a2b](https://github.com/tgenov/ha-iletcomfort/commit/cca9a2bf5ef5a1d6fbe00f6f6991f1762512c185))
+
+## [0.19.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.18.4...v0.19.0) (2026-11-25)
+
+
+### Features
+
+* **kjrh120l:** control Zone 1 setpoint, run mode and Zone 1 power ([#149](https://github.com/tgenov/ha-iletcomfort/issues/149)) ([52982cd](https://github.com/tgenov/ha-iletcomfort/commit/52982cd19e557669a5ea3e9738b4c0e3643b0dd3))
+
 ## [0.18.4](https://github.com/tgenov/ha-iletcomfort/compare/v0.18.3...v0.18.4) (2026-11-17)
 
 

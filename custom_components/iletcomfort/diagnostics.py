@@ -20,6 +20,8 @@ from homeassistant.core import HomeAssistant
 from .api import SENSOR_DISCONNECTED, TEMP_OFFSET, mask_identifier
 from .const import CONF_APPLIANCE_CODE, DOMAIN
 from .coordinator import ILetComfortCoordinator
+from .model_profiles import ModelProfile, atw_sensors_are_placeholder
+from .protocols import get_adapter
 
 # Account credentials are the only secrets in the entry. Region is kept as-is.
 # appliance_code is a device-unique identifier, so it is suffix-masked (see
@@ -103,6 +105,34 @@ async def async_get_config_entry_diagnostics(
     if appliance is not None and "applianceCode" in appliance:
         appliance["applianceCode"] = mask_identifier(appliance["applianceCode"])
 
+    status_obj = data.get("status")
+    sensors_obj = data.get("sensors")
+    raw_frames: dict[int, bytes] = dict(data.get("raw_frames") or {})
+    if not raw_frames:
+        if status_obj is not None and status_obj.raw_body:
+            raw_frames[0x01] = bytes(status_obj.raw_body)
+        if sensors_obj is not None and sensors_obj.raw_body:
+            raw_sensors = bytes(sensors_obj.raw_body)
+            raw_frames[raw_sensors[0]] = raw_sensors
+
+    adapter = get_adapter(coordinator.sn8)
+    profile = adapter.profile
+    raw_0x02 = raw_frames.get(0x02, b"")
+    # Preserve legacy synthetic tests whose sensors.raw_body does not start with
+    # 0x02 (e.g. b"\xbb\x02...") while ensuring ATW 0x10 frames are never
+    # offset-scanned with -35 as if they were 0x02.
+    scan_source = (
+        raw_0x02
+        if raw_0x02
+        else (
+            bytes(sensors_obj.raw_body)
+            if sensors_obj is not None
+            and sensors_obj.raw_body
+            and sensors_obj.raw_body[:1] != b"\x10"
+            else b""
+        )
+    )
+
     return {
         "entry": {
             "version": entry.version,
@@ -120,12 +150,23 @@ async def async_get_config_entry_diagnostics(
             "sensors_degraded": coordinator._sensors_degraded,
             "repair_issued": coordinator._repair_issued,
         },
+        "protocol": {
+            "resolved_profile": profile.value,
+            "matched_variant": adapter.describe_variant(status_obj),
+            "atw_0x02_placeholder": (
+                atw_sensors_are_placeholder(raw_0x02)
+                if profile is ModelProfile.ATW and raw_0x02
+                else None
+            ),
+            "kjrh120l_zone1_capable": coordinator.kjrh120l_zone1_capable,
+            "probes": coordinator.capabilities.probes_as_dict(),
+            "raw_frames": {
+                f"0x{subtype:02x}": _format_hex(body)
+                for subtype, body in sorted(raw_frames.items())
+            },
+        },
         "appliance": appliance,
-        "status": _serialize_frame(data.get("status")),
-        "sensors": _serialize_frame(data.get("sensors")),
-        "sensors_temperature_scan": _sensors_temperature_scan(
-            sensors_obj.raw_body
-            if (sensors_obj := data.get("sensors")) is not None
-            else b""
-        ),
+        "status": _serialize_frame(status_obj),
+        "sensors": _serialize_frame(sensors_obj),
+        "sensors_temperature_scan": _sensors_temperature_scan(scan_source),
     }
