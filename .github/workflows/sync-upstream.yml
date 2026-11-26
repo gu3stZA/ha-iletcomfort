@@ -6,6 +6,9 @@
 # here (vX.Y.Z.N = upstream X.Y.Z + local mode, N counts our own builds), which
 # Home Assistant's HACS/Marketplace then offers as an update.
 #
+# If the branch already holds the upstream tag (merged by hand) but no
+# vX.Y.Z.N release exists for it, the run tests and publishes that release.
+#
 # On a merge conflict or a failing test nothing is pushed: the working branch
 # stays as it was and an issue is opened in this fork. Note: GITHUB_TOKEN
 # cannot push changes to workflow files, so if an upstream release edits
@@ -54,16 +57,29 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           git fetch --no-tags "https://github.com/$UPSTREAM.git" \
             "+refs/tags/$tag:refs/tags/upstream-$tag"
-          if git merge-base --is-ancestor "upstream-$tag" HEAD; then
-            echo "Already contains upstream $tag; nothing to do."
-            echo "needed=false" >> "$GITHUB_OUTPUT"
-          else
+          # A release here is vX.Y.Z.N for upstream vX.Y.Z.
+          pattern="^v$(printf '%s' "${tag#v}" | sed 's/\./\\./g')\.[0-9]+$"
+          released=false
+          if gh release list --limit 100 --json tagName -q '.[].tagName' | grep -Eq "$pattern"; then
+            released=true
+          fi
+          if ! git merge-base --is-ancestor "upstream-$tag" HEAD; then
             echo "Upstream $tag is new; merging."
+            echo "merge=true" >> "$GITHUB_OUTPUT"
             echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$released" = false ]; then
+            # Merged by hand (e.g. after a conflict) but not released yet.
+            echo "Already contains upstream $tag but no release exists; releasing."
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already contains and released upstream $tag; nothing to do."
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Merge upstream release
-        if: steps.up.outputs.needed == 'true'
+        if: steps.up.outputs.merge == 'true'
         env:
           TAG: ${{ steps.up.outputs.tag }}
         run: |
@@ -113,4 +129,4 @@ jobs:
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-          To sync by hand: \`git fetch origin --tags && git merge $TAG\`, fix conflicts, run \`pytest\`, then push \`$BRANCH\` and create a release."
+          To sync by hand: merge upstream $TAG into \`$BRANCH\`, fix conflicts, run \`pytest\` and push. The next run (or a manual one) then publishes the release."
