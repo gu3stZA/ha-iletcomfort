@@ -86,7 +86,7 @@ async def async_get_config_entry_diagnostics(
 ) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
     coordinator: ILetComfortCoordinator = hass.data[DOMAIN][entry.entry_id]
-    data = coordinator.data or {}
+    state = coordinator.data
 
     # async_redact_data leaves appliance_code intact (it is not a credential);
     # suffix-mask the device-unique id so a shared diagnostics file can be
@@ -105,9 +105,9 @@ async def async_get_config_entry_diagnostics(
     if appliance is not None and "applianceCode" in appliance:
         appliance["applianceCode"] = mask_identifier(appliance["applianceCode"])
 
-    status_obj = data.get("status")
-    sensors_obj = data.get("sensors")
-    raw_frames: dict[int, bytes] = dict(data.get("raw_frames") or {})
+    status_obj = state.status if state is not None else None
+    sensors_obj = state.sensors if state is not None else None
+    raw_frames: dict[int, bytes] = dict(state.raw_frames) if state is not None else {}
     if not raw_frames:
         if status_obj is not None and status_obj.raw_body:
             raw_frames[0x01] = bytes(status_obj.raw_body)
@@ -117,6 +117,9 @@ async def async_get_config_entry_diagnostics(
 
     adapter = get_adapter(coordinator.sn8)
     profile = adapter.profile
+    energy_merged = getattr(coordinator, "_atw_energy_notify", None)
+    if not isinstance(energy_merged, bytes):
+        energy_merged = None
     raw_0x02 = raw_frames.get(0x02, b"")
     # Preserve legacy synthetic tests whose sensors.raw_body does not start with
     # 0x02 (e.g. b"\xbb\x02...") while ensuring ATW 0x10 frames are never
@@ -164,6 +167,11 @@ async def async_get_config_entry_diagnostics(
                 f"0x{subtype:02x}": _format_hex(body)
                 for subtype, body in sorted(raw_frames.items())
             },
+            # Sentinel-filtered 0x04 energy state actually applied (latest
+            # valid value per field); raw_frames["0x04"] is the literal frame.
+            "atw_energy_notify_merged": (
+                _format_hex(energy_merged) if energy_merged is not None else None
+            ),
         },
         "appliance": appliance,
         "status": _serialize_frame(status_obj),

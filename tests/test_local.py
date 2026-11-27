@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant import data_entry_flow
@@ -21,6 +21,8 @@ from custom_components.iletcomfort.api import (
     extract_c3_body,
     parse_hex_response,
 )
+from custom_components.iletcomfort.c3_frame import build_c3_frame
+from custom_components.iletcomfort.commands import SetHvacModeCommand
 from custom_components.iletcomfort.const import (
     CONF_APPLIANCE_CODE,
     CONF_CONNECTION_MODE,
@@ -101,6 +103,21 @@ def test_select_response_prefers_matching_query_subtype():
     # An unsolicited status frame arrives alongside the sensors reply.
     assert select_response(SENSORS_QUERY, [LAN_STATUS, LAN_SENSORS]) == LAN_SENSORS
     assert select_response(STATUS_QUERY, [LAN_STATUS, LAN_SENSORS]) == LAN_STATUS
+
+
+def test_eco_query_accepts_short_shared_reply_only_after_an_exact_match():
+    query = bytes.fromhex(build_c3_query(0x07))
+
+    def frame(message_type, body):
+        return bytes.fromhex(build_c3_frame(message_type, bytes(body)))
+
+    short = frame(0x03, [0x05, 1])
+    exact = frame(0x03, [0x07, 1])
+    long_silent = frame(0x03, [0x05] + [0] * 6)
+    unsolicited = frame(0x04, [0x05, 1])
+    assert select_response(query, [short, long_silent]) == short
+    assert select_response(query, [exact, short]) == exact
+    assert select_response(query, [long_silent, unsolicited]) is None
 
 
 def test_select_response_falls_back_to_last_c3_frame_for_set():
@@ -295,10 +312,13 @@ async def test_local_mode_overrides_phone_app_restrictions(hass: HomeAssistant):
     coord = ILetComfortCoordinator(hass, entry)
     assert coord._push_enabled is False
 
-    coord.client = MagicMock()
-    coord.async_request_refresh = MagicMock(return_value=_done())
-    await coord.async_set_device(mode=1)  # must not raise
-    coord.client.set_device.assert_called_once()
+    coord.async_request_refresh = AsyncMock()
+    with patch.object(coord.local_transport, "send_hex_command", return_value=LAN_STATUS.hex()) as send:
+        await coord.async_send_command(SetHvacModeCommand("heat"))
+    query, write = [bytes.fromhex(call.args[0]) for call in send.call_args_list]
+    assert query == STATUS_QUERY
+    assert write[9] == 0x02  # SET used the same LAN transport as the fresh read.
+    coord.async_request_refresh.assert_awaited_once()
 
 
 async def test_phone_app_mode_still_blocks_control_in_cloud(hass: HomeAssistant):
@@ -306,7 +326,7 @@ async def test_phone_app_mode_still_blocks_control_in_cloud(hass: HomeAssistant)
     entry.add_to_hass(hass)
     coord = ILetComfortCoordinator(hass, entry)
     with pytest.raises(HomeAssistantError):
-        await coord.async_set_device(mode=1)
+        await coord.async_send_command(SetHvacModeCommand("heat"))
 
 
 async def test_sn8_falls_back_to_persisted_value(hass: HomeAssistant):

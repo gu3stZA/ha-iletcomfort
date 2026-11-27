@@ -62,6 +62,12 @@ LOCAL_PORT = 6444
 # local mode keeps the right decode profile when the cloud is unreachable.
 CONF_SN8 = "sn8"
 
+# Opt-in standard Midea C3 control for sn8 171H120F units whose status frame
+# matches the C3 basic layout. Hardware-validated on a Rotenso Aquami only, so
+# it stays off until the owner confirms their unit behaves the same way.
+CONF_C3_BASIC_CONTROL = "c3_basic_control"
+DEFAULT_C3_BASIC_CONTROL = False
+
 # AWS IoT MQTT broker (TLS, mutual-cert auth). Endpoint/port come from the cert
 # response; this port is the documented default and a fallback.
 MQTT_DEFAULT_PORT = 8883

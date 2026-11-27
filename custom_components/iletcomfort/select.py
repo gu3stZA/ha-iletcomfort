@@ -9,13 +9,13 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .commands import SetSilentModeCommand, SetZoneRunModeCommand
 from .const import DOMAIN
 from .coordinator import ILetComfortCoordinator
 from .entity import async_add_kjrh120l_zone1_entities, build_device_info
 from .model_profiles import (
     KJRH120L_RUN_MODE_COOL,
     KJRH120L_RUN_MODE_HEAT,
-    kjrh120l_mode_change_setpoint,
 )
 
 MUTE_OPTIONS = ["Off", "Level 1", "Level 2"]
@@ -61,16 +61,14 @@ class ILetComfortMuteSelect(CoordinatorEntity[ILetComfortCoordinator], SelectEnt
 
     @property
     def current_option(self) -> str:
-        if self.coordinator.data is None:
+        state = self.coordinator.data
+        if state is None:
             return "Off"
-        sensors = self.coordinator.data.get("sensors")
-        if sensors is None or sensors.ctrl_flag != 1:
-            return "Off"
-        # mute_level: 0=Level 1, 1=Level 2
-        return "Level 2" if sensors.mute_level == 1 else "Level 1"
+        return {0: "Off", 1: "Level 1", 2: "Level 2"}.get(state.silent_level, "Off")
 
     async def async_select_option(self, option: str) -> None:
-        await self.coordinator.async_set_device(mute=_MUTE_TO_API[option])
+        level = _MUTE_TO_API[option]
+        await self.coordinator.async_send_command(SetSilentModeCommand(level=level))
 
 
 class ILetComfortKjrh120lModeSelect(
@@ -95,25 +93,15 @@ class ILetComfortKjrh120lModeSelect(
 
     @property
     def current_option(self) -> str | None:
-        status = (self.coordinator.data or {}).get("status")
-        if status is None:
+        if self.coordinator.data is None:
             return None
-        for option, code in _KJRH120L_RUN_MODE_OPTIONS.items():
-            if status.kjrh120l_run_mode == code:
-                return option
-        return None
+        run_mode = self.coordinator.data.zone1_run_mode
+        return run_mode if run_mode in _KJRH120L_RUN_MODE_OPTIONS else None
 
     async def async_select_option(self, option: str) -> None:
-        run_mode = _KJRH120L_RUN_MODE_OPTIONS.get(option)
-        if run_mode is None:
+        if option not in _KJRH120L_RUN_MODE_OPTIONS:
             raise HomeAssistantError(f"Unsupported KJRH-120L mode {option!r}")
-        status = (self.coordinator.data or {}).get("status")
-        if status is None:
-            raise HomeAssistantError("The heat pump has not reported its status yet")
-        try:
-            zone1_temperature = kjrh120l_mode_change_setpoint(status, run_mode)
-        except ValueError as err:
-            raise HomeAssistantError(f"Cannot switch to {option}: {err}") from err
-        await self.coordinator.async_set_device(
-            zone1_run_mode=run_mode, zone1_temperature=zone1_temperature
+        mode_intent: str = option
+        await self.coordinator.async_send_command(
+            SetZoneRunModeCommand(zone=1, mode=mode_intent)  # type: ignore[arg-type]
         )

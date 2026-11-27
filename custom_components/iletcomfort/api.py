@@ -15,6 +15,7 @@ from .c3_frame import (
     SENSOR_DISCONNECTED,
     TEMP_OFFSET,
     _temp_offset,
+    build_c3_frame,
     build_c3_query,
     build_c3_set,
     extract_c3_body,
@@ -73,6 +74,7 @@ __all__ = [
     "ITSSensors",
     "ITSStatus",
     "_temp_offset",
+    "build_c3_frame",
     "build_c3_query",
     "build_c3_set",
     "decode_its_sensors",
@@ -179,18 +181,24 @@ class ITSStatus:
     vacation_start_day: int = 0
     vacation_end_month: int = 0
     vacation_end_day: int = 0
-    exv_drg: int = 0
-    pressure_h: int = 0
-    pressure_l: int = 0
-    comp_frq: int | None = 0
-    total_kwh: int = 0
-    comp_total_run_hours: int = 0
+    # Telemetry below defaults to None (not decoded); each decoder or subtype
+    # overlay sets it only when the frame actually carries it, so an entity
+    # can tell unknown from a real zero (#111). Cumulative counters must never
+    # read 0 in place of unknown (that is a meter reset in HA statistics).
+    exv_drg: int | None = None
+    pressure_h: int | None = None
+    pressure_l: int | None = None
+    comp_frq: int | None = None
+    total_kwh: int | None = None
+    total_thermal_kwh: int | None = None
+    comp_total_run_hours: int | None = None
     fan_total_run_hours: int = 0
     # KJRH-120L dual variant's separate DHW target (status body[15], issue #5).
     kjrh120l_dhw_setpoint: float | None = None
     # KJRH-120L Zone 1 fields from the subtype 0x01 body, decoded on every
     # KJRH-120L frame regardless of body[8:10] (app capture 2026-11-12/14).
     kjrh120l_zone1_power: bool | None = None  # body[8]
+    kjrh120l_dhw_power: bool | None = None  # body[10]
     kjrh120l_run_mode: int | None = None  # body[11], heat=3, cool=2
     kjrh120l_zone1_setpoint: float | None = None  # body[12]
     kjrh120l_zone1_heat_max: int | None = None  # body[37]
@@ -199,6 +207,12 @@ class ITSStatus:
     kjrh120l_zone1_cool_min: int | None = None  # body[40]
     # KJRH-120L outdoor ambient temp (status body[57] - 196; #148/#142/#136/#119).
     kjrh120l_outdoor_temp: float | None = None
+    # ATW subtype 0x05 (Silent/Super-Silent) and 0x07/0x05 (ECO) decoded state (#139/#188).
+    atw_silent_mode: bool | None = None
+    atw_silent_level: int | None = None  # 0=Off, 1=Level 1, 2=Level 2 (Super Silent)
+    atw_silent_super_selected: bool | None = None  # raw bit 3 (retained even when OFF)
+    atw_eco_mode: bool | None = None
+    atw_eco_timer: bool | None = None
     # Standard Midea C3 basic status (``c3_basic.C3BasicStatus``) when an ATW
     # (sn8 171H120F) status frame matches that layout; None otherwise.
     c3_basic: Any = None
@@ -300,11 +314,12 @@ class ITSSensors:
     online_num: int = 0
     odu_mac_type: int = 0
     limit_frq_code: int = 0
-    tf_temp: float | None = 0
-    tp_temp: float | None = 0
-    th_temp: float | None = 0
+    # Telemetry defaults to None (not decoded) rather than 0 (#111).
+    tf_temp: float | None = None
+    tp_temp: float | None = None
+    th_temp: float | None = None
     water_pres: int = 0
-    water_flow: int = 0
+    water_flow: int | None = None
     capacity_hp: int = 0
     t3_temp: float | None = None
     t4_temp: float | None = None
@@ -313,15 +328,15 @@ class ITSSensors:
     twin_temp: float | None = None
     twout_temp: float | None = None
     t1_temp: float | None = None
-    odu_current: float | None = 0.0
-    odu_voltage: int | None = 0
-    dc_current: int = 0
+    odu_current: float | None = None
+    odu_voltage: int | None = None
+    dc_current: int | None = None
     idu_version: str = ""
     odu_version: str = ""
     hmi_version: str = ""
     ctrl_flag: int = 0  # d+41: 0=normal, 1=mute, 2=boost
     mute_level: int = 0  # d+40: 0=Level 1 (or off), 1=Level 2
-    dc_voltage: int = 0
+    dc_voltage: int | None = None
     ibh1_total_run_hours: int = 0
     ibh2_total_run_hours: int = 0
     tbh_total_run_hours: int = 0
@@ -408,7 +423,12 @@ def decode_its_sensors(body: bytearray) -> ITSSensors:
 
 
 class ILetComfortClient(DollinCloudClient):
-    """Client for the iLetComfort / Midea Dollin cloud API (C3 protocol layer)."""
+    """Client for the iLetComfort / Midea Dollin cloud API (C3 protocol layer).
+
+    For writes the client is transport only: the selected protocol dialect
+    plans the command (``protocols.*.plan_write``) and the coordinator runs the
+    plan's fresh read and SET over ``send_hex_command`` (#113).
+    """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -487,252 +507,76 @@ class ILetComfortClient(DollinCloudClient):
             )
         return decode_its_sensors(body)
 
+    def _query_c3_subtype(
+        self,
+        appliance_code: str,
+        subtype: int,
+        *,
+        expected_types: tuple[int, ...],
+        min_len: int,
+        label: str,
+    ) -> bytes:
+        """Query a C3 extended subtype and validate its response header and length."""
+        command = build_c3_query(subtype)
+        response_hex = self.send_hex_command(appliance_code, command)
+        _LOGGER.debug("%s raw response: %s", label, response_hex)
+        raw = parse_hex_response(response_hex)
+        body_type, body = extract_c3_body(raw)
+        if body_type not in expected_types or len(body) < min_len:
+            raise ApiError(
+                f"{label} returned unexpected or truncated frame "
+                f"(type=0x{body_type:02x}, {len(body)} body bytes)"
+            )
+        return bytes(body)
+
     def query_atw_unit_params(self, appliance_code: str) -> bytes:
         """Query ATW subtype 0x10 unit parameters for live telemetry (#120)."""
         from .model_profiles import ATW_UNIT_PARAMS_MIN_LEN, ATW_UNIT_PARAMS_SUBTYPE
 
-        command = build_c3_query(ATW_UNIT_PARAMS_SUBTYPE)
-        response_hex = self.send_hex_command(appliance_code, command)
-        _LOGGER.debug("query_atw_unit_params raw response: %s", response_hex)
-        raw = parse_hex_response(response_hex)
-        body_type, body = extract_c3_body(raw)
-        if body_type != ATW_UNIT_PARAMS_SUBTYPE or len(body) < ATW_UNIT_PARAMS_MIN_LEN:
-            raise ApiError(
-                f"ATW unit_params (0x10) returned unexpected or truncated frame "
-                f"(type=0x{body_type:02x}, {len(body)} body bytes)"
-            )
-        return bytes(body)
+        return self._query_c3_subtype(
+            appliance_code,
+            ATW_UNIT_PARAMS_SUBTYPE,
+            expected_types=(ATW_UNIT_PARAMS_SUBTYPE,),
+            min_len=ATW_UNIT_PARAMS_MIN_LEN,
+            label="ATW unit_params (0x10)",
+        )
 
     def query_atw_hmi_params(self, appliance_code: str) -> bytes:
         """Query ATW subtype 0x0A HMI parameters for compressor run hours (#120)."""
         from .model_profiles import ATW_HMI_PARAMS_MIN_LEN, ATW_HMI_PARAMS_SUBTYPE
 
-        command = build_c3_query(ATW_HMI_PARAMS_SUBTYPE)
-        response_hex = self.send_hex_command(appliance_code, command)
-        _LOGGER.debug("query_atw_hmi_params raw response: %s", response_hex)
-        raw = parse_hex_response(response_hex)
-        body_type, body = extract_c3_body(raw)
-        if body_type != ATW_HMI_PARAMS_SUBTYPE or len(body) < ATW_HMI_PARAMS_MIN_LEN:
-            raise ApiError(
-                f"ATW hmi_params (0x0A) returned unexpected or truncated frame "
-                f"(type=0x{body_type:02x}, {len(body)} body bytes)"
-            )
-        return bytes(body)
-
-    def set_device(
-        self,
-        appliance_code: str,
-        *,
-        sn8: str | None = None,
-        mode: int | None = None,
-        temperature: int | None = None,
-        boost: bool | None = None,
-        mute: int | None = None,
-        mute_level: int | None = None,
-        power_on: bool = False,
-        last_on_state: tuple[int, int] | None = None,
-        zone1_temperature: int | None = None,
-        zone1_run_mode: int | None = None,
-        zone1_power: bool | None = None,
-    ) -> dict[str, Any]:
-        """Send a SET command to the heat pump.
-
-        ``sn8`` selects the write encoding per model. The KJRH-120L (sn8
-        17100003) rejects the standard 62-byte C3 SET frame, so for that profile
-        a captured short write command (``00 <field> 01 <value> ff``) is sent
-        directly. Every other (unknown/None/ATW/AQUAPURA) sn8 keeps the legacy
-        build_c3_set path unchanged: query current status for echo bytes, merge
-        the requested changes, validate temperature ranges, build and send the
-        SET frame.
-
-        ``zone1_temperature``, ``zone1_run_mode`` and ``zone1_power`` exist only
-        for the KJRH-120L. Any other sn8 raises ApiError before anything is sent.
-        """
-        # Imported lazily to avoid a circular import (model_profiles imports api).
-        from .model_profiles import ModelProfile, resolve_profile
-
-        if resolve_profile(sn8) is ModelProfile.KJRH120L:
-            return self._set_device_kjrh120l(
-                appliance_code,
-                mode=mode,
-                temperature=temperature,
-                power_on=power_on,
-                zone1_temperature=zone1_temperature,
-                zone1_run_mode=zone1_run_mode,
-                zone1_power=zone1_power,
-            )
-        if any(
-            value is not None
-            for value in (zone1_temperature, zone1_run_mode, zone1_power)
-        ):
-            raise ApiError(
-                "Zone 1 setpoint, run mode and Zone 1 power writes are only "
-                "supported on the KJRH-120L (sn8 17100003)"
-            )
-
-        # Query current status for echo bytes
-        command = build_c3_query(0x01)
-        response_hex = self.send_hex_command(appliance_code, command)
-        _LOGGER.debug("set_device status raw response: %s", response_hex)
-        raw = parse_hex_response(response_hex)
-        _body_type, status_body = extract_c3_body(raw)
-        status = decode_its_status(status_body)
-
-        # An unknown mode can mean this model uses a different status layout.
-        # Even an explicit mode override cannot make its echoed bytes safe.
-        if status.mode not in (*QUERY_TO_SET_MODE, 3):
-            raise ApiError(
-                f"Unrecognized status mode {status.mode}; refusing to send a "
-                "control command using an unvalidated status layout"
-            )
-        current_set_mode = QUERY_TO_SET_MODE.get(status.mode)
-
-        # Handle power_on: restore last on-state
-        if power_on and last_on_state is not None:
-            if mode is None:
-                mode = last_on_state[0]
-            if temperature is None:
-                temperature = last_on_state[1]
-
-        eff_mode = mode if mode is not None else current_set_mode
-        if eff_mode is None:
-            raise ApiError(
-                "Cannot preserve Auto mode in a control command; "
-                "select an explicit operating mode first"
-            )
-        # Use active mode setpoint (t5s_def, offset-decoded) not DHW target (set_temperature)
-        if temperature is not None:
-            eff_temp = temperature
-        elif status.t5s_def is not None:
-            eff_temp = int(status.t5s_def)
-        else:
-            eff_temp = status.set_temperature
-        temp_explicitly_set = temperature is not None
-
-        # Determine ctrl_flag and mute_level
-        eff_ctrl_flag = 0x00
-        eff_mute_level = 0x00
-
-        if boost is True:
-            eff_ctrl_flag = 0x02
-        elif mute is not None:
-            if mute == 0:
-                eff_ctrl_flag = 0x00
-            else:
-                eff_ctrl_flag = 0x01
-                eff_mute_level = 0x00 if mute == 1 else 0x01
-
-        if mute_level is not None:
-            eff_mute_level = mute_level
-
-        # Validate temperature
-        if temp_explicitly_set and eff_mode in TEMP_RANGES and eff_mode != MODE_OFF:
-            temp_min, temp_max = TEMP_RANGES[eff_mode]
-            if not (temp_min <= eff_temp <= temp_max):
-                mode_name = {v: k for k, v in MODE_MAP.items()}.get(eff_mode, "unknown")
-                raise ValueError(
-                    f"Temperature {eff_temp}C out of range for {mode_name} mode "
-                    f"(allowed: {temp_min}-{temp_max}C)"
-                )
-
-        # Build and send
-        set_hex = build_c3_set(
-            mode=eff_mode,
-            temperature=eff_temp,
-            status_body=status_body,
-            mute_level=eff_mute_level,
-            ctrl_flag=eff_ctrl_flag,
+        return self._query_c3_subtype(
+            appliance_code,
+            ATW_HMI_PARAMS_SUBTYPE,
+            expected_types=(ATW_HMI_PARAMS_SUBTYPE,),
+            min_len=ATW_HMI_PARAMS_MIN_LEN,
+            label="ATW hmi_params (0x0A)",
         )
 
-        set_response_hex = self.send_hex_command(appliance_code, set_hex)
+    def query_atw_silent(self, appliance_code: str) -> bytes:
+        """Query ATW subtype 0x05 Silent / Super-Silent state (#139/#188)."""
+        from .model_profiles import ATW_SILENT_MIN_LEN, ATW_SILENT_SUBTYPE
 
-        return {
-            "sent": set_hex,
-            "response": set_response_hex,
-            "effective_mode": eff_mode,
-            "effective_temp": eff_temp,
-        }
+        return self._query_c3_subtype(
+            appliance_code,
+            ATW_SILENT_SUBTYPE,
+            expected_types=(ATW_SILENT_SUBTYPE,),
+            min_len=ATW_SILENT_MIN_LEN,
+            label="ATW silent (0x05)",
+        )
 
-    def _set_device_kjrh120l(
-        self,
-        appliance_code: str,
-        *,
-        mode: int | None,
-        temperature: int | None,
-        power_on: bool,
-        zone1_temperature: int | None = None,
-        zone1_run_mode: int | None = None,
-        zone1_power: bool | None = None,
-    ) -> dict[str, Any]:
-        """Send a KJRH-120L (sn8 17100003) control command (issue #35).
-
-        This controller rejects the standard C3 SET frame, so a single captured
-        short command is sent directly (no status query, no checksum). One of:
-          - temperature → DHW setpoint write (``0007 01 <temp> ff``)
-          - power_on / mode→heat → DHW power ON (``00020101ff``)
-          - mode→off → DHW power OFF (``00020100ff``)
-          - zone1_temperature → Zone 1 setpoint (``0004 01 <temp> ff``)
-          - zone1_run_mode + zone1_temperature → run mode paired with the
-            Zone 1 setpoint, as the app sends it
-          - zone1_power → Zone 1 power (``0000 01 <0|1> ff``)
-
-        The caller (climate entity) has already clamped ``temperature`` to the
-        DHW range. Temperature takes priority over a same-call mode change.
-        A Zone 1 write cannot be combined with any other write; the frame
-        builders reject values that do not fit the captured shape.
-        """
-        # Imported lazily to avoid a circular import (model_profiles imports api).
+    def query_atw_eco(self, appliance_code: str) -> bytes:
+        """Query ATW subtype 0x07 (or shared 0x05) ECO state (#139/#188)."""
         from .model_profiles import (
-            KJRH120L_DHW_OFF,
-            KJRH120L_DHW_ON,
-            build_kjrh120l_run_mode,
-            build_kjrh120l_set_temperature,
-            build_kjrh120l_zone1_power,
-            build_kjrh120l_zone1_setpoint,
+            ATW_ECO_MIN_LEN,
+            ATW_ECO_SUBTYPE,
+            ATW_SILENT_SUBTYPE,
         )
 
-        effective: dict[str, Any]
-        if any(v is not None for v in (zone1_temperature, zone1_run_mode, zone1_power)):
-            if temperature is not None or mode is not None or power_on:
-                raise ValueError(
-                    "A KJRH-120L Zone 1 write cannot be combined with a DHW write"
-                )
-            if zone1_power is not None:
-                if zone1_temperature is not None or zone1_run_mode is not None:
-                    raise ValueError(
-                        "KJRH-120L Zone 1 power is a separate write from the "
-                        "setpoint and run mode"
-                    )
-                command = build_kjrh120l_zone1_power(zone1_power)
-                effective = {"effective_zone1_power": zone1_power}
-            elif zone1_run_mode is not None:
-                if zone1_temperature is None:
-                    raise ValueError(
-                        "A KJRH-120L run mode write needs the Zone 1 setpoint "
-                        "for the destination mode"
-                    )
-                command = build_kjrh120l_run_mode(zone1_run_mode, zone1_temperature)
-                effective = {
-                    "effective_run_mode": zone1_run_mode,
-                    "effective_zone1_temp": zone1_temperature,
-                }
-            else:
-                assert zone1_temperature is not None
-                command = build_kjrh120l_zone1_setpoint(zone1_temperature)
-                effective = {"effective_zone1_temp": zone1_temperature}
-            response_hex = self.send_hex_command(appliance_code, command)
-            return {"sent": command, "response": response_hex, **effective}
-
-        if temperature is not None:
-            command = build_kjrh120l_set_temperature(int(temperature))
-            effective = {"effective_temp": int(temperature)}
-        elif power_on or (mode is not None and mode != MODE_OFF):
-            command = KJRH120L_DHW_ON
-            effective = {"effective_power": True}
-        else:
-            # mode is MODE_OFF (turn off / hvac_mode → off).
-            command = KJRH120L_DHW_OFF
-            effective = {"effective_power": False}
-
-        response_hex = self.send_hex_command(appliance_code, command)
-        return {"sent": command, "response": response_hex, **effective}
+        return self._query_c3_subtype(
+            appliance_code,
+            ATW_ECO_SUBTYPE,
+            expected_types=(ATW_ECO_SUBTYPE, ATW_SILENT_SUBTYPE),
+            min_len=ATW_ECO_MIN_LEN,
+            label="ATW eco (0x07)",
+        )

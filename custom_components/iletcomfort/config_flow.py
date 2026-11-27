@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 import requests
 import voluptuous as vol
@@ -29,6 +29,7 @@ from .api import ApiError, AuthError, ILetComfortClient
 from .const import (
     CONF_APPLIANCE_CODE,
     CONF_CONNECTION_MODE,
+    CONF_C3_BASIC_CONTROL,
     CONF_ENABLE_MQTT_PUSH,
     CONF_LOCAL_HOST,
     CONF_LOCAL_KEY,
@@ -38,6 +39,7 @@ from .const import (
     CONNECTION_MODE_CLOUD,
     CONNECTION_MODE_LOCAL,
     DEFAULT_CONNECTION_MODE,
+    DEFAULT_C3_BASIC_CONTROL,
     DEFAULT_ENABLE_MQTT_PUSH,
     LOCAL_PORT,
     DEFAULT_OPERATION_MODE,
@@ -50,6 +52,7 @@ from .const import (
     REGION_US,
 )
 from .local import async_validate_local
+from .model_profiles import ModelProfile, resolve_profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -151,9 +154,11 @@ class ILetComfortConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._appliances = appliances
                     return await self.async_step_device()
 
+        # HA 2026.10+ types data_schema as probatio.Schema, while this
+        # integration supports HA 2024.1+ where voluptuous.Schema is required.
         return self.async_show_form(
             step_id="user",
-            data_schema=STEP_USER_DATA_SCHEMA,
+            data_schema=cast(Any, STEP_USER_DATA_SCHEMA),
             errors=errors,
         )
 
@@ -193,7 +198,7 @@ class ILetComfortConfigFlow(ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(
             step_id="device",
-            data_schema=schema,
+            data_schema=cast(Any, schema),
             errors=errors,
         )
 
@@ -226,6 +231,11 @@ class ILetComfortOptionsFlow(OptionsFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = dict(user_input)
+            options = self.config_entry.options
+            if not self._offers_c3_basic_control() and CONF_C3_BASIC_CONTROL in options:
+                # Keep an earlier choice when the field is not shown (e.g.
+                # the model code is not known yet).
+                data[CONF_C3_BASIC_CONTROL] = options[CONF_C3_BASIC_CONTROL]
             if data.get(CONF_CONNECTION_MODE) == CONNECTION_MODE_LOCAL:
                 errors = await self._async_validate_local(data)
             else:
@@ -237,7 +247,7 @@ class ILetComfortOptionsFlow(OptionsFlow):
 
         return self.async_show_form(
             step_id="init",
-            data_schema=self._schema(user_input),
+            data_schema=cast(Any, self._schema(user_input)),
             errors=errors,
         )
 
@@ -287,40 +297,54 @@ class ILetComfortOptionsFlow(OptionsFlow):
             )
         connection = options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
         secret = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
-        return vol.Schema(
-            {
+        fields: dict[Any, Any] = {
+            vol.Required(
+                CONF_OPERATION_MODE, default=current,
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        OPERATION_MODE_HA_PRIMARY,
+                        OPERATION_MODE_PHONE_APP,
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="operation_mode",
+                )
+            ),
+            vol.Required(
+                CONF_CONNECTION_MODE, default=connection,
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[CONNECTION_MODE_CLOUD, CONNECTION_MODE_LOCAL],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key="connection_mode",
+                )
+            ),
+            vol.Optional(
+                CONF_LOCAL_HOST,
+                description={"suggested_value": options.get(CONF_LOCAL_HOST)},
+            ): TextSelector(),
+            vol.Optional(
+                CONF_LOCAL_TOKEN,
+                description={"suggested_value": options.get(CONF_LOCAL_TOKEN)},
+            ): secret,
+            vol.Optional(
+                CONF_LOCAL_KEY,
+                description={"suggested_value": options.get(CONF_LOCAL_KEY)},
+            ): secret,
+        }
+        if self._offers_c3_basic_control():
+            fields[
                 vol.Required(
-                    CONF_OPERATION_MODE, default=current,
-                ): SelectSelector(
-                    SelectSelectorConfig(
-                        options=[
-                            OPERATION_MODE_HA_PRIMARY,
-                            OPERATION_MODE_PHONE_APP,
-                        ],
-                        mode=SelectSelectorMode.DROPDOWN,
-                        translation_key="operation_mode",
-                    )
-                ),
-                vol.Required(
-                    CONF_CONNECTION_MODE, default=connection,
-                ): SelectSelector(
-                    SelectSelectorConfig(
-                        options=[CONNECTION_MODE_CLOUD, CONNECTION_MODE_LOCAL],
-                        mode=SelectSelectorMode.DROPDOWN,
-                        translation_key="connection_mode",
-                    )
-                ),
-                vol.Optional(
-                    CONF_LOCAL_HOST,
-                    description={"suggested_value": options.get(CONF_LOCAL_HOST)},
-                ): TextSelector(),
-                vol.Optional(
-                    CONF_LOCAL_TOKEN,
-                    description={"suggested_value": options.get(CONF_LOCAL_TOKEN)},
-                ): secret,
-                vol.Optional(
-                    CONF_LOCAL_KEY,
-                    description={"suggested_value": options.get(CONF_LOCAL_KEY)},
-                ): secret,
-            }
-        )
+                    CONF_C3_BASIC_CONTROL,
+                    default=options.get(
+                        CONF_C3_BASIC_CONTROL, DEFAULT_C3_BASIC_CONTROL
+                    ),
+                )
+            ] = bool
+        return vol.Schema(fields)
+
+    def _offers_c3_basic_control(self) -> bool:
+        """Offer C3 basic control only for loaded sn8 171H120F (ATW) units."""
+        coordinator = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id)
+        sn8 = getattr(coordinator, "sn8", None)
+        return resolve_profile(sn8) is ModelProfile.ATW

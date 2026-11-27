@@ -21,6 +21,9 @@ import logging
 from typing import Any
 
 from .api import ApiError
+from .protocols.atw import (
+    ATW_ECO_MIN_LEN, ATW_ECO_SUBTYPE, ATW_SILENT_FULL_LEN, ATW_SILENT_SUBTYPE,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,9 +47,9 @@ def select_response(request: bytes, responses: list[bytes]) -> bytes | None:
 
     The module also delivers unsolicited frames on the same connection: status
     notifications (message type 0x04, body subtype 0x01), and late replies to
-    earlier requests. A query must only ever be answered by a frame carrying
-    the same body subtype, otherwise a status body would be decoded as sensors
-    (and vice versa). Query replies (0x03) win over notifications (0x04) with
+    earlier requests. Match the requested subtype so a status body is never
+    decoded as sensors. Some ATW units use a short 0x05 reply to a 0x07 ECO
+    query, so accept that documented fallback after checking for exact matches. Query replies (0x03) win over notifications (0x04) with
     the same subtype; the newest frame wins within each group.
 
     For a SET (0x02) the echo is preferred, falling back to the newest C3
@@ -58,6 +61,12 @@ def select_response(request: bytes, responses: list[bytes]) -> bytes | None:
         for wanted_type in (QUERY_MESSAGE_TYPE, NOTIFY_MESSAGE_TYPE):
             for frame in reversed(frames):
                 if frame[9] == wanted_type and frame[10] == subtype:
+                    return frame
+        if subtype == ATW_ECO_SUBTYPE:
+            for frame in reversed(frames):
+                body = frame[10:-1]
+                if (frame[9] == QUERY_MESSAGE_TYPE and body[0] == ATW_SILENT_SUBTYPE
+                        and ATW_ECO_MIN_LEN <= len(body) < ATW_SILENT_FULL_LEN):
                     return frame
         return None
     for frame in reversed(frames):

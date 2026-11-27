@@ -43,6 +43,7 @@ from custom_components.iletcomfort.model_profiles import (
     decode_kjrh120l_status,
     resolve_profile,
 )
+from tests.snapshot_helpers import make_state
 
 
 def _make_client() -> ILetComfortClient:
@@ -157,6 +158,18 @@ ATW_TEMPLATE_SENSOR_VARIANTS = {
     "sinclair_active_schedule": _bytes(
         "02,00,05,32,0b,00,0f,00,03,28,12,00,16,1e,03,28,00,00,00,00,"
         "03,28,00,00,00,00,03,28,00,00,00,00,03,28,00,00,00,00"
+    ),
+    # Western MONO 2 (#124 Comment 1): 75-byte template with 02,0c (Cool 12 C) slots.
+    "western_cool_template": _bytes(
+        "02,00,02,0c,00,00,00,00,02,0c,00,00,00,00,02,0c,00,00,00,00,"
+        "02,0c,00,00,00,00,02,0c,00,00,00,00,02,0c,00,00,00,00,00,"
+        "02,0c,00,00,00,00,02,0c,00,00,00,00,02,0c,00,00,00,00,"
+        "02,0c,00,00,00,00,02,0c,00,00,00,00,02,0c,00,00,00,00"
+    ),
+    # Kosner ATW (#134): 38-byte schedule mixing 03,19 / 03,28 (07:30->00:00) / 02,0c.
+    "kosner_mixed_cool_schedule": _bytes(
+        "02,00,03,19,00,00,00,00,03,28,07,1e,00,00,02,0c,00,00,00,00,"
+        "02,0c,00,00,00,00,02,0c,00,00,00,00,02,0c,00,00,00,00"
     ),
 }
 
@@ -334,34 +347,38 @@ def test_nordis_27_byte_status_zone1_off_when_power_bit_clear():
     assert decode_atw_status(bytes(body)).mode_name == "Off"
 
 
-def test_25_byte_atw_frames_keep_italtherm_layout():
-    """Unvalidated 25-byte masks (Kaisai [2]=0x11) keep the established decode."""
+def test_25_byte_atw_frames_decode_via_c3_basic_layout():
+    """All valid C3Basic 171H120F frames use Zone-1 power and cap_water selector."""
     body = ATW_25_BYTE_STATUS_FRAMES["kaisai"]
     status = decode_atw_status(body)
 
-    assert status.t5s_def == body[9] / 2
+    # Kaisai [2]=0x11 has zone1_water_temp=True -> body[6] (35 °C), zone1_power=False.
+    assert status.t5s_def == float(body[6])
     assert status.mode_name == "Off"
-    assert status.comp_running is False
+    assert status.comp_running is None
+    assert status.comp_frq is None
 
 
-def test_25_byte_rotenso_frame_decodes_zone1_power():
-    """Rotenso [2]=0x15 (#124): bit 0 of byte[1] is Zone-1 power."""
+def test_25_byte_rotenso_frame_decodes_zone1_power_and_water_target():
+    """Rotenso [2]=0x15 (#124): Zone-1 power + zone1_water_temp selects body[6]."""
     body = ATW_25_BYTE_STATUS_FRAMES["rotenso"]
     status = decode_atw_status(body)
 
-    assert status.t5s_def == body[9] / 2  # setpoint mapping unchanged
+    assert status.t5s_def == float(body[6])
     assert status.mode_name == "Heat"
     assert status.comp_running is None
 
 
 @pytest.mark.parametrize("mask", [0x05, 0x11, 0x13, 0x73])
-def test_other_25_byte_capability_masks_do_not_decode_zone1_power(mask):
+def test_other_25_byte_capability_masks_decode_zone1_power_and_setpoint(mask):
     body = bytearray(ATW_25_BYTE_STATUS_FRAMES["rotenso"])
     body[2] = mask
     status = decode_atw_status(bytes(body))
 
-    assert status.mode_name == "Off"
-    assert status.comp_running is False
+    assert status.mode_name == "Heat"
+    expected_target = float(body[6]) if (mask & 0x10) else body[9] / 2
+    assert status.t5s_def == expected_target
+    assert status.comp_running is None
 
 
 def test_atw_profile_applied_to_status_object():
@@ -372,11 +389,13 @@ def test_atw_profile_applied_to_status_object():
     assert std.set_temperature == 3
 
     atw = apply_profile_to_status(ModelProfile.ATW, std)
+    # Mode is Off because Italtherm state1 has zone1_power=False (body[4]=3 Heat).
+    assert atw.mode_name == "Off"
     assert atw.set_temperature == 50
     assert atw.t5s_def == 21.0
     assert atw.box_bottom_temp == 46.0
     assert atw.error_code == 0
-    assert not atw.comp_running
+    assert atw.comp_running is None
 
 
 def test_atw_tank_temp_routed_to_th_temp_not_twin_temp():
@@ -433,10 +452,20 @@ def test_atw_template_sensor_variants_are_unavailable(name):
             "02,00,03,1e,00,00,00,00,03,28,00,00,00,00,03,1e,00,00,00,00,"
             "03,1e,00,00,00,00,03,1e,00,00,00,00,03,1e,00,00,00,00"
         ),
-        # A group does not start with 0x03.
+        # Idle slot tag (0x05) is not an allowed idle mode tag (0x02/0x03).
         _bytes(
             "02,00,03,1e,00,00,00,00,05,1e,00,00,00,00,03,1e,00,00,00,00,"
             "03,1e,00,00,00,00,03,1e,00,00,00,00,03,1e,00,00,00,00"
+        ),
+        # More than two distinct idle headers even with an active slot.
+        _bytes(
+            "02,00,03,19,00,00,00,00,03,28,07,1e,00,00,02,0c,00,00,00,00,"
+            "03,20,00,00,00,00,02,0c,00,00,00,00,02,0c,00,00,00,00"
+        ),
+        # Disallowed tag byte (0x04) in a schedule slot.
+        _bytes(
+            "02,00,04,19,00,00,00,00,03,28,07,1e,00,00,02,0c,00,00,00,00,"
+            "02,0c,00,00,00,00,02,0c,00,00,00,00,02,0c,00,00,00,00"
         ),
         # Fewer than six groups.
         _bytes("02,00,03,1e,00,00,00,00,03,1e,00,00,00,00,03,1e,00,00,00,00"),
@@ -500,11 +529,12 @@ def test_atw_dhw_tank_sensor_value_fn_returns_tank_temp(name):
     status = decode_atw_status(ATW_FRAMES[name])
     out = apply_profile_to_sensors(ModelProfile.ATW, sensors, status)
 
+    state = make_state(status, out, sn8=ATW_SN8)
     dhw = next(d for d in SENSOR_DESCRIPTIONS if d.key == "dhw_tank")
-    assert dhw.value_fn({"sensors": out, "status": status}) == tank
+    assert dhw.value_fn(state) == tank
     # The Water Inlet sensor must not carry the tank value.
     water_inlet = next(d for d in SENSOR_DESCRIPTIONS if d.key == "water_inlet")
-    assert water_inlet.value_fn({"sensors": out, "status": status}) != tank
+    assert water_inlet.value_fn(state) != tank
 
 
 # ---------------------------------------------------------------------------
@@ -620,15 +650,15 @@ def test_kjrh120l_status_surfaces_confirmed_setpoint_only():
     # raw_body preserved.
     assert status.raw_body == bytes(KJRH120L_STATUS_BODY)
     # The bogus fields the STANDARD decode produced must NOT be populated.
-    assert status.total_kwh in (None, 0)
-    assert status.comp_frq in (None, 0)
+    assert status.total_kwh is None
+    assert status.comp_frq is None
     assert status.box_bottom_temp is None
     assert status.tr_temperature is None
     assert status.ptc_temperature is None
-    assert status.exv_drg in (None, 0)
-    assert status.comp_total_run_hours in (None, 0)
-    assert status.pressure_h in (None, 0)
-    assert status.pressure_l in (None, 0)
+    assert status.exv_drg is None
+    assert status.comp_total_run_hours is None
+    assert status.pressure_h is None
+    assert status.pressure_l is None
 
 
 def test_kjrh120l_status_setpoint_tracks_body15():
@@ -722,8 +752,8 @@ def test_kjrh120l_profile_applied_to_status_object():
     assert kjrh.set_temperature == 60
     assert kjrh.error_code == 0
     assert kjrh.comp_running is False
-    assert kjrh.total_kwh in (None, 0)
-    assert kjrh.comp_frq in (None, 0)
+    assert kjrh.total_kwh is None
+    assert kjrh.comp_frq is None
     assert kjrh.box_bottom_temp is None
 
 

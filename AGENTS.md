@@ -82,7 +82,17 @@ user to do hard work — re-read the whole thread and check the new signal again
   C3 has no dedicated `hbt` topic, but valid `dev` status frames have been observed from an idle/off
   AQUAPURA roughly every 15 minutes. The integration treats those frames as an end-to-end device-status
   heartbeat and allows up to 45 minutes for missed cycles before marking push stale; MQTT PINGREQ/PINGRESP
-  remains transport-level liveness.
+  remains transport-level liveness. **That cadence is not universal:** a `171H120F` Hyundai HPSI-Split
+  (#129) sent no `0x01` pushes at all and only sporadic `0x04` (`C3EnergyBody`) change notifications,
+  so the 45-minute watchdog expired on a healthy link in every test. The heartbeat is therefore gated
+  per dialect (`ProtocolAdapter.periodic_status_push`, `False` for ATW). ATW availability follows MQTT
+  connect/disconnect only. Unknown `sn8` → STANDARD keeps the heartbeat.
+  On ATW units, phone-app mode only sees the optional subtypes from the setup poll; pushes carry 0x01
+  and/or 0x04 only, if anything (#225). Cumulative counters (0x10 energy, 0x0A run hours) are kept on
+  push, but live 0x10 telemetry (compressor frequency/running, pressures, EXV) is only available from the
+  setup poll and goes unknown after the first push. ECO state reflects the setup poll until restart,
+  because no push frame carries it (0x01 `body[3]` does not change with ECO, #139). Silent on/off
+  follows the pushed 0x01 bit; the level comes from the setup 0x05 only while both agree.
   This is documented in `README.md` / `docs/TROUBLESHOOTING.md`. `14xxx` codes are the auth range.
 
 ---
@@ -116,7 +126,7 @@ Status `raw_body` (0-indexed; STANDARD misreads this 25-byte frame):
 - `byte[22]` = DHW tank current temp, **direct °C** (`ATW_DHW_TANK_TEMP_INDEX`).
 - `byte[1]`  = flags (`ATW_FLAGS_INDEX`); bit `0x01` = space-heat demand (`ATW_SPACE_HEAT_DEMAND_BIT`).
 - `byte[24]` = constant `0x80` flags/MSB byte — **NOT an error code** (STANDARD wrongly read it as 128).
-- ATW sets `error_code=0` and `comp_running=False` (no confirmed running signal in this short frame).
+- ATW sets `error_code=0` and `comp_running=None` (no confirmed running signal in any 0x01 layout; only 0x10 sets it).
 - `decode_atw_status(body)` implements this. Uncertain HVAC mode/action is left conservative — validate
   on hardware before adding.
 - **Sensor-template variant (#38, Galmet Prima 8GT):** a 75-byte `0x02` response containing only the
@@ -155,18 +165,14 @@ Status `raw_body` (0-indexed; STANDARD misreads this 25-byte frame):
   mode (3 heat, 2 cool), `[6]` zone1 water target, `[7]` zone2, `[8]` DHW target, `[9]` room target
   ×2, `[10..21]` limits, `[22]` tank, `[23]` error. `decode_c3_basic` decodes the raw fields into
   `ITSStatus.c3_basic`; `model_profiles.atw_c3_basic(sn8, status)` returns it only for the ATW profile.
-- **Rotenso layout (25 bytes, `[2]=0x15`):** `[1]` bit 0 is Zone-1 power — confirmed by the #124
-  reporter (heating on in the app) and on a second unit by switching Zone-1 from HA and seeing it in
-  the app. Decoded as Heat/Off, or Cool when `[4]` is Cool. Compressor state is unknown (`None`).
-- **Every other 25-byte mask** (Italtherm `0x07`, Kaisai #123 `0x11`, …): unchanged — `[1]` bit 0
-  stays space-heat demand, not Heat/Off, until validated on that hardware. The gate is the exact
-  Rotenso signature (`len == 25 and [2] == 0x15`), never "not Italtherm".
-- **Zone-1 setpoint is unresolved for the Rotenso layout.** The #124 reporter's app showed 24 °C =
-  `[9]/2` while `[6]` was 40; the second Rotenso's app shows 29 °C = `[6]` while `[9]/2` is 24. Both
-  frames carry `[2]=0x15` (water-temperature control) and `[9]/2` lies below the zone1 heat minimum
-  in both. Until corrected evidence or a validated discriminator exists, the climate keeps the
-  established `[9]/2` mapping; both candidates are exposed as the `zone1_water_target` /
-  `room_target` climate attributes so reporters can compare them with the app.
+- **Unified `C3BasicStatus` read decode (`171H120F`):** Cross-checking `midea-local`
+  (`MideaC3Device.process_message`) against 10+ Dollin hardware captures (`#22`, `#38`, `#120`, `#125`,
+  `#129`, `#132`, `#134`, `#143`, `#150`, `#151`) confirms all `C3BasicStatus` frames use `[1] & 0x01`
+  as Zone-1 power (`[4]` Cool/Heat), and `body[2] & 0x10` (`zone1_water_temp`) to select `body[6]`
+  (direct water target) vs `body[9]/2` (0.5 °C room target). Compressor state stays `None` in `0x01`
+  and is overlaid by `0x10` when supported. Note: `#124` (`merol77a`, `[2]=0x15`) had one snapshot
+  reporting 24 °C (`[9]/2`) while `[6]=40` (unconfirmed since Comment 7); both `zone1_water_target`
+  and `room_target` remain exposed as climate attributes alongside `zone1_temp_mode`.
 - The DHW water-heater entity (`water_heater.py`) is added only after a status frame for an ATW unit
   matched the layout (re-evaluated on coordinator updates, since `sn8` can be unknown at setup).
 - **Subtype `0x10` live telemetry (`v0.21.0`, #120 / #139 / #142):** `171H120F` firmware splits on
@@ -177,13 +183,65 @@ Status `raw_body` (0-indexed; STANDARD misreads this 25-byte frame):
   schedule template). `coordinator.py` probes `0x10` only when `0x02` is a placeholder and disables
   it for the session after the first `ApiError` or invalid frame. Compressor total run hours are not
   in `0x10`; they sit in subtype `0x0A` (`body[4..5]`, verified on NØRDIS #120) and are polled only
-  when `0x10` succeeds, with their own single-probe `ApiError` session disable.
+  when `0x10` succeeds, with their own single-probe `ApiError` session disable. The `0x10` energy
+  counters (`total_kwh`, `total_thermal_kwh`) use the same sentinel filter as `0x04`
+  (`atw.valid_energy_counter`: `0`/`0xFFFFFFFF` are never applied; the field keeps the base status
+  value, i.e. unknown after a fresh poll/push decode, never `0`; #232).
 - **Airwell Wellea Split (`sn8 171H120F`, #139) controlled Silent/ECO test:** 27-byte status with
   `body[2]=0x73`, `body[3]=0x90`, tail `e0,05,00` (does not match the `body[3:6] == a0,03,03`
   Galmet/NØRDIS signature). Both Silent Level 1 and Super Silent (Level 2) set `body[3] & 0x02`
   (`0x90 → 0x92`), confirming `0x01` only carries binary Silent ON/OFF (`super_silent_level` lives
-  in `0x05`). Enabling ECO left `body[3]=0x90` unchanged (do not assume `body[3] & 0x08` carries ECO
-  on all `171H120F` units).
+  in `0x05`), while ECO left `body[3]=0x90` unchanged. Follow-up forced-mode captures (#139 C8)
+  confirmed separate responses matching `midea-local` (`main`): **`0x05`** 10-byte Silent (`bit 0`
+  ON/OFF, `bit 1` timer 1, `bit 3` Super Silent retained even when OFF, `body[2..9]` timer slots)
+  and **`0x07`** 7-byte ECO (`bit 0` ON/OFF, `bit 1` timer, `body[2..6]` timer slots). We also
+  retain the `0x05 <= 6B` ECO fallback (`midea-local` #300) in `apply_atw_silent` / `apply_atw_eco`.
+- **Cross-checking `midea-local` before reverse-engineering `0xC3`:** Do **not** add `midea-local`
+  as a runtime dependency (it couples to local LAN/MSmartHome and risks HA Core dependency clashes),
+  but **do** cross-check [`midea-lan/midea-local`](https://github.com/midea-lan/midea-local)
+  (`midealocal/devices/c3/message.py`) before reverse-engineering any `171H120F` subtype (`0x01`,
+  `0x04`, `0x05`, `0x0A`, `0x10`) or `0xC3` SET command (`MessageSet`, `MessageSetECO`,
+  `MessageSetSilent`). Treat `midea-local` as the candidate byte map and still verify against at
+  least one real Dollin hardware capture before shipping.
+
+### `171H120F` control: standard Midea C3 SET — hardware-validated on Rotenso Aquami (water) & Heiwa (#42, room), opt-in
+- **Writes work with the standard Midea C3 SET**, not the 62-byte ITS frame (`build_c3_set`, `1214`):
+  `c3_frame.build_c3_frame` (same AA header as the query), message type `0x02`, body `01 [power]
+  [mode] [z1] [z2] [dhw] [room×2] [curve flags]`, direct °C (no +35). Accepted with `code=0`; the
+  device answers with its full new status. Validated one at a time on a Rotenso Aquami (EU,
+  2026-11-17), each re-queried and reverted, all in Heat mode with water-temperature control: DHW
+  target, DHW power, Zone-1 water target, Zone-1 curve, Zone-1 power (from HA, confirmed in the
+  app). The exact accepted frames are pinned in `tests/test_c3_basic.py`.
+- Silent = SET body `05` + 9 bytes, ECO = `07` + 6 bytes; bit 0 of the first byte is on/off (and
+  bit 3 is Super Silent for `0x05`, cleared explicitly when selecting Silent Level 1 via
+  `ILetComfortMuteSelect`) and the rest is the unit's timer schedule, copied from a fresh `05`/`07`
+  query (midea-local zeroes it). A reply shorter than the validated layout (silence 9 data bytes,
+  ECO 5 + one accepted `00` pad) is rejected before any SET — never zero-fill a schedule.
+- **Gating:** control is an options-flow opt-in (`CONF_C3_BASIC_CONTROL`, offered only for ATW units)
+  because Italtherm (#22), Galmet (#38), and other `171H120F` frames also match the layout but are
+  not validated for writes. Only the ATW dialect plans C3 SETs (other dialects refuse C3-only
+  intents) and it never plans the legacy ITS frame; `c3_basic.apply_basic_changes` refuses mode changes, any Zone-1
+  power-on/setpoint/curve change unless the unit is already in Heat (a Heat request must never power
+  on Cool), water-target writes on room-mode units (and vice versa), and DHW/Fast-DHW writes when
+  `cap_dhw` is False. Both water-temperature (`body[6]`) and room-temperature (`body[9]`, 0.5 °C)
+  setpoint writes, `Fast DHW` (`switch.*_fast_dhw` when `cap_dhw`), and `select.*_silent_mode`
+  (Off / Level 1 / Level 2) are routed through C3 basic/feature SET when opt-in is enabled.
+- **One write path (#113):** entities send typed commands (`commands.py`) to
+  `coordinator.async_send_command`, which asks the selected dialect's pure
+  `ProtocolAdapter.plan_write(command, WriteContext)` for a `WritePlan` (`protocols/write.py`).
+  Capability checks, ranges, refusals and frame encoding live in the dialect
+  (`protocols/{standard,aquapura,atw,kjrh120l}.py`). A plan is static (KJRH-120L short writes) or
+  read-modify-write: it names the `FreshRead` query and a pure `encode(fresh_body)`.
+  `run_write_plan` does read → encode → send inside `coordinator.async_execute_command`, which
+  handles the phone-app guard, a per-appliance `_write_lock` spanning the fresh read → SET (and any
+  auth retry, which repeats the read), one re-auth, `HomeAssistantError` wrapping, and refresh on
+  success only. `WriteRefused` is surfaced verbatim; `ApiError`/`ValueError` as "Heat pump command
+  failed: …". The client is write transport only (`send_hex_command`). Frame builders live in
+  `c3_basic.py` / `protocols/kjrh120l.py` / `c3_frame.py`; entities pass semantic commands only
+  (no hex). `tests/test_write_planning.py` is the (dialect, state, command) → hex | refusal table.
+- Query support on Rotenso (`171H120F`): `01`, `05`, `07` return real data; `02` returns the
+  placeholder template; `04` zeros; `08`, `09`, `0A`, `10` are rejected with `1214` (whereas `0x10`
+  and `0x0A` succeed on NØRDIS #120 and Airwell #139).
 
 ### KJRH-120L dual variant (`sn8 17100003`, #5 / #69) — hardware-validated reads & Zone-1 writes
 - The same `sn8` covers pure-DHW and Zone-1 + DHW controllers. Gate the dual layout only when status
@@ -221,9 +279,20 @@ Status `raw_body` (0-indexed; STANDARD misreads this 25-byte frame):
   AQUAPURA layouts.
 
 ### Entity routing (important)
-- `sensor.py`: **"Water Inlet Temperature"** ← `twin_temp`; **"DHW Tank Temperature"** ← `th_temp`.
-- `climate.py` `current_temperature` is **profile-aware**: `th_temp` for AQUAPURA and validated ATW
-  layouts, unavailable for the ATW sensor-template variant, and `twin_temp` for STANDARD.
+- Entities read **only domain-named `HeatPumpState` properties** (`protocols/base.py`), never
+  `ITSStatus`/`ITSSensors` wire fields (#111). Model-specific routing lives in the property
+  (data-driven) or in a `ProtocolAdapter` method (e.g. `dhw_target_temp`). Add a property before an
+  entity needs a new value. Climate's per-regime mode/target/bounds logic still reads `C3BasicStatus`
+  (#192).
+- `sensor.py`: **"Water Inlet Temperature"** ← `water_inlet_temp` (`twin_temp`); **"DHW Tank
+  Temperature"** ← `dhw_tank_temp` (`th_temp`).
+- **Unknown vs zero:** telemetry fields (`comp_frq`, `exv_drg`, `pressure_h/l`, `total_kwh`,
+  `comp_total_run_hours`, sensor `tf/tp/th_temp`, `odu_*`, `water_flow`, `dc_*`) default to `None`
+  and are set only by a decoder/overlay that actually carries them. Never default a telemetry field
+  to `0`: TOTAL_INCREASING energy/run-hours reading 0 for unknown is a meter reset in HA statistics.
+- `climate.py` `current_temperature` (`climate_current_temperature`) is **profile-aware**: `th_temp`
+  for AQUAPURA and validated ATW layouts, unavailable for the ATW sensor-template variant, and
+  `twin_temp` for STANDARD.
 - For ATW/AQUAPURA the tank temp is routed into **`th_temp`** (so the correctly-named "DHW Tank
   Temperature" entity shows it). Do **not** route a tank reading into `twin_temp` (that mislabels "Water
   Inlet"). This was corrected after a reporter flagged it.
@@ -331,13 +400,16 @@ does not enforce per-appliance topic ACLs.
 | `scripts/fetch_plugin.py` | **Dev tool, not shipped** — fetches the vendor per-model plugin bundle (`0xC3` = Weex JS) via the `version:"0.0.0"` downgrade on `/v1/product/upgrade/plugin/get/latest`. Source of truth for the control **schema** (not bytes) — see §4. |
 | `scripts/c3_probe.py` | **Dev tool, not shipped, read-only** — sends C3 queries for `171H120F` units and decodes them (midea-local C3 layouts); reads only `ILET_EMAIL`/`ILET_PASSWORD`/`ILET_REGION` from `.env`. Cannot send SET frames. |
 | `model_profiles.py` | `ModelProfile` enum, `_SN8_PROFILES` table, `resolve_profile`, `decode_atw_status`, `apply_profile_to_status`, `apply_profile_to_sensors`. **Add new model support here.** |
-| `c3_basic.py` | Standard Midea C3 basic status decode (`decode_c3_basic`, `C3BasicStatus`) for `171H120F` frames. |
+| `protocols/snapshot.py` | `build_snapshot(adapter, status, sensors, raw_frames, *, retained_subtypes=False, energy_notify=None)` — the **one** pure step that applies the profile sensors decode and every ATW overlay (0x10 → 0x0A → 0x05/0x07 when C3 basic → 0x04 last). `_poll`, `_apply_push_status` and `_apply_push_energy` and the corpus contract all use it (#225); never re-implement the overlay chain elsewhere. Pushes pass `retained_subtypes=True` (0x10 counters only, 0x05 reconciled with the 0x01 Silent bit) and the coordinator's sentinel-filtered 0x04 state as `energy_notify`; `raw_frames[0x04]` stays literal. Probing stays in the coordinator. |
+| `c3_basic.py` | Standard Midea C3 basic status decode (`decode_c3_basic`, `C3BasicStatus`) and validated SET builders (`apply_basic_changes`, `build_basic_set`, `build_feature_set`) for `171H120F`; used by the ATW dialect's `plan_write`. |
+| `c3_frame.py` | Low-level C3 framing (`build_c3_frame`, `build_c3_query`, `build_c3_set`, `parse_hex_response`, `extract_c3_body`, `_temp_offset`). |
 | `water_heater.py` | DHW entity for ATW units whose status matches the C3 basic layout. |
-| `coordinator.py` | `ILetComfortCoordinator`: polling, re-auth, cache-fallback, offline Repair card. Caches `appliance_meta` (best-effort, never fatal) and exposes `sn8`; threads profile into decode. |
+| `coordinator.py` | `ILetComfortCoordinator` (`DataUpdateCoordinator[HeatPumpState]`): polling, re-auth, cache-fallback, offline Repair card. `coordinator.data` is the typed `HeatPumpState` returned by `build_snapshot` (`status`, `sensors`, `raw_frames`); there is no dict snapshot (#111). Caches `appliance_meta` (best-effort, never fatal) and exposes `sn8`; threads profile into decode. |
 | `diagnostics.py` | Redacted snapshot: raw frames, decoded status/sensors, `sensors_temperature_scan` (per-byte `_temp_offset` map — use it to find a model's misplaced temp byte), and the `appliance` metadata block. `APPLIANCE_TO_REDACT = {owner, sn, name}` (keeps `applianceType`/`modelNumber`/`sn8`). |
-| `climate.py` / `number.py` / `sensor.py` / `binary_sensor.py` / `switch.py` / `select.py` | HA entities. See §4 for which field backs which entity. |
+| `climate.py` / `number.py` / `sensor.py` / `binary_sensor.py` / `switch.py` / `select.py` / `water_heater.py` | HA entities; they read domain-named `HeatPumpState` properties only. See §4 entity routing. |
+| `protocols/base.py` | `HeatPumpState` (`coordinator.data`, domain-named read properties, unknown = `None`) and the `ProtocolAdapter` contract. |
 | `config_flow.py` / `__init__.py` / `const.py` / `entity.py` | Setup, entry, constants, base entity. |
-| `tests/` | pytest suite; real captured frames are pinned as fixtures (e.g. issue-#11 frames for STANDARD regression). |
+| `tests/` | pytest suite; real captured frames are pinned as fixtures (e.g. issue-#11 frames for STANDARD regression). Build a test `coordinator.data` with `tests/snapshot_helpers.py::make_state(status, sensors, raw_frames, sn8=...)`, which runs the production `build_snapshot`. |
 
 ---
 
@@ -356,7 +428,7 @@ does not enforce per-appliance topic ACLs.
 
 ## 7. Dev & release workflow
 
-- **`main` is protected:** required status checks `pytest (Python 3.12)` + `Validate Conventional Commits
+- **`main` is protected:** required status checks `pytest` + `Validate Conventional Commits
   title`, and `enforce_admins=true`. **No direct pushes** — they're rejected. Land changes via a PR
   (CI auto-runs, ~30s) and merge.
 - **release-please** drives versioning from Conventional Commits on `main` (`feat:` → minor, `fix:`/
@@ -383,4 +455,5 @@ does not enforce per-appliance topic ACLs.
   mitmproxy).
 - Out-of-scope (Midea MSmartHome) devices: <https://github.com/georgezhao2010/midea_ac_lan>,
   <https://github.com/midea-lan/midea-local>.
+- `docs/C3_PROTOCOL_MATRIX.md` (Hardware-Verified Dollin vs. `midea-local` candidate matrix across `0x01`/`0x02`/`0x05`/`0x0A`/`0x10` and write dialects).
 - `README.md` (scope, install, login-war note) and `docs/TROUBLESHOOTING.md`, `CONTRIBUTING.md`.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
@@ -17,6 +17,13 @@ from custom_components.iletcomfort.api import (
     ITSSensors,
     ITSStatus,
 )
+from custom_components.iletcomfort.commands import (
+    SetDhwTargetCommand,
+    SetTargetTemperatureCommand,
+    SetZonePowerCommand,
+    SetZoneRunModeCommand,
+    SetZoneTargetCommand,
+)
 from custom_components.iletcomfort.const import (
     CONF_APPLIANCE_CODE,
     CONF_REGION,
@@ -30,6 +37,11 @@ from custom_components.iletcomfort.coordinator import (
     SUSTAINED_FAILURE_THRESHOLD,
     ILetComfortCoordinator,
 )
+from custom_components.iletcomfort.model_profiles import (
+    decode_kjrh120l_status as _decode_kjrh120l_status,
+)
+from tests.kjrh120l_snapshots import KJRH120L_SNAPSHOT_A as _KJRH120L_SNAPSHOT_A
+from tests.snapshot_helpers import make_state
 
 
 def _entry(region: str | None) -> MockConfigEntry:
@@ -120,7 +132,7 @@ async def test_poll_falls_back_to_cache_on_truncated_frame(hass: HomeAssistant):
     client = mock_cls.return_value
     cached_status = ITSStatus(mode=1)
     cached_sensors = ITSSensors()
-    coord.data = {"status": cached_status, "sensors": cached_sensors}
+    coord.data = make_state(cached_status, cached_sensors, sn8=coord.sn8)
 
     client.query_status.side_effect = ApiError("truncated frame")
     client.query_sensors.side_effect = ApiError("truncated frame")
@@ -131,8 +143,8 @@ async def test_poll_falls_back_to_cache_on_truncated_frame(hass: HomeAssistant):
     ):
         result = await coord._poll()
 
-    assert result["status"] is cached_status
-    assert result["sensors"] is cached_sensors
+    assert result.status is cached_status
+    assert result.sensors is cached_sensors
 
 
 async def test_single_transient_failure_logs_debug_not_warning(
@@ -154,7 +166,7 @@ async def test_single_transient_failure_logs_debug_not_warning(
         coord = ILetComfortCoordinator(hass, entry)
 
     client = mock_cls.return_value
-    coord.data = {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+    coord.data = make_state(ITSStatus(mode=1), ITSSensors(), sn8=coord.sn8)
 
     with patch(
         "custom_components.iletcomfort.coordinator.asyncio.sleep",
@@ -201,7 +213,7 @@ async def test_intermittent_failures_never_warn(hass: HomeAssistant, caplog):
         coord = ILetComfortCoordinator(hass, entry)
 
     client = mock_cls.return_value
-    coord.data = {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+    coord.data = make_state(ITSStatus(mode=1), ITSSensors(), sn8=coord.sn8)
     good_status = ITSStatus(mode=1)
     good_sensors = ITSSensors()
 
@@ -244,7 +256,7 @@ async def test_sustained_failures_warn_once_at_threshold_then_debug(
         coord = ILetComfortCoordinator(hass, entry)
 
     client = mock_cls.return_value
-    coord.data = {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+    coord.data = make_state(ITSStatus(mode=1), ITSSensors(), sn8=coord.sn8)
     client.query_status.side_effect = ApiError("502 Bad Gateway")
     client.query_sensors.side_effect = ApiError("502 Bad Gateway")
 
@@ -279,7 +291,7 @@ async def test_recovery_after_sustained_logs_info_once(hass: HomeAssistant, capl
         coord = ILetComfortCoordinator(hass, entry)
 
     client = mock_cls.return_value
-    coord.data = {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+    coord.data = make_state(ITSStatus(mode=1), ITSSensors(), sn8=coord.sn8)
     client.query_status.side_effect = ApiError("502 Bad Gateway")
     client.query_sensors.side_effect = ApiError("502 Bad Gateway")
 
@@ -411,9 +423,9 @@ async def test_poll_passes_sn8_and_applies_atw_overrides(hass: HomeAssistant):
     assert client.query_status.call_args.args == ("APPL1", "171H120F")
     assert client.query_sensors.call_args.args == ("APPL1", "171H120F")
     # th_temp (DHW Tank Temperature sensor) now reflects the tank reading.
-    assert result["sensors"].th_temp == 46.0
+    assert result.sensors.th_temp == 46.0
     # Water Inlet (twin_temp) stays honest — never the tank value.
-    assert result["sensors"].twin_temp != 46.0
+    assert result.sensors.twin_temp != 46.0
 
 
 async def test_poll_standard_leaves_sensors_untouched(hass: HomeAssistant):
@@ -438,13 +450,13 @@ async def test_poll_standard_leaves_sensors_untouched(hass: HomeAssistant):
 
     assert client.query_status.call_args.args == ("APPL1", None)
     assert client.query_sensors.call_args.args == ("APPL1", None)
-    assert result["sensors"] is sensors  # STANDARD is a no-op (object identity)
-    assert result["sensors"].twin_temp == 12.0  # unchanged by STANDARD
+    assert result.sensors is sensors  # STANDARD is a no-op (object identity)
+    assert result.sensors.twin_temp == 12.0  # unchanged by STANDARD
 
 
-async def test_async_set_device_threads_sn8_to_client(hass: HomeAssistant):
-    """The SET path must forward the appliance sn8 so the client can branch the
-    write encoding per model (KJRH-120L short commands vs the legacy C3 frame)."""
+async def test_async_send_command_plans_in_the_sn8_dialect(hass: HomeAssistant):
+    """The write path selects the dialect from the appliance sn8, so a KJRH-120L
+    gets its short command and not the legacy C3 frame (#113)."""
     entry = _entry(REGION_US)
     entry.add_to_hass(hass)
     with patch(
@@ -456,11 +468,10 @@ async def test_async_set_device_threads_sn8_to_client(hass: HomeAssistant):
     client = mock_cls.return_value
     coord.async_request_refresh = AsyncMock()
 
-    await coord.async_set_device(temperature=60)
+    await coord.async_send_command(SetDhwTargetCommand(60))
 
-    assert client.set_device.call_args.args == ("APPL1",)
-    assert client.set_device.call_args.kwargs["sn8"] == "17100003"
-    assert client.set_device.call_args.kwargs["temperature"] == 60
+    assert client.send_hex_command.call_args_list == [call("APPL1", "0007013cff")]
+    coord.async_request_refresh.assert_awaited_once()
 
 
 async def test_phone_app_mode_rejects_account_control(hass: HomeAssistant):
@@ -475,9 +486,9 @@ async def test_phone_app_mode_rejects_account_control(hass: HomeAssistant):
         coordinator = ILetComfortCoordinator(hass, entry)
 
     with pytest.raises(HomeAssistantError, match="HA primary"):
-        await coordinator.async_set_device(temperature=42)
+        await coordinator.async_send_command(SetTargetTemperatureCommand(42))
 
-    cls.return_value.set_device.assert_not_called()
+    cls.return_value.send_hex_command.assert_not_called()
 
 
 def _degraded_coordinator(hass: HomeAssistant) -> tuple[ILetComfortCoordinator, MagicMock]:
@@ -489,7 +500,7 @@ def _degraded_coordinator(hass: HomeAssistant) -> tuple[ILetComfortCoordinator, 
     ) as mock_cls:
         coord = ILetComfortCoordinator(hass, entry)
     client = mock_cls.return_value
-    coord.data = {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+    coord.data = make_state(ITSStatus(mode=1), ITSSensors(), sn8=coord.sn8)
     return coord, client
 
 
@@ -672,7 +683,7 @@ async def test_model_discovery_drops_incompatible_cache(hass: HomeAssistant):
     with patch("custom_components.iletcomfort.coordinator.ILetComfortClient") as cls:
         coord = ILetComfortCoordinator(hass, entry)
     client = cls.return_value
-    coord.data = {"status": ITSStatus(mode=19), "sensors": ITSSensors()}
+    coord.data = make_state(ITSStatus(mode=19), ITSSensors(), sn8=coord.sn8)
     coord._last_on_state = (1, 30)
     client.list_appliances.return_value = [{"applianceCode": "APPL1", "sn8": "171H120F"}]
     client.query_status.side_effect = ApiError("offline")
@@ -795,7 +806,7 @@ async def test_phone_app_mode_push_start_failure_does_not_fall_back_to_polling(
     entry.add_to_hass(hass)
     coordinator = ILetComfortCoordinator(hass, entry)
     coordinator.async_set_updated_data(
-        {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+        make_state(ITSStatus(mode=1), ITSSensors(), sn8=coordinator.sn8)
     )
 
     with patch(
@@ -837,16 +848,16 @@ async def test_push_status_updates_data_keeping_sensors(hass: HomeAssistant):
 
     prior_sensors = ITSSensors()
     coordinator.async_set_updated_data(
-        {"status": ITSStatus(mode=0), "sensors": prior_sensors}
+        make_state(ITSStatus(mode=0), prior_sensors, sn8=coordinator.sn8)
     )
 
     pushed = ITSStatus(mode=1, set_temperature=42)
     coordinator._apply_push_status(pushed)
 
-    assert coordinator.data["status"].mode == 1
-    assert coordinator.data["status"].set_temperature == 42
+    assert coordinator.data.status.mode == 1
+    assert coordinator.data.status.set_temperature == 42
     # sensors come from the poll, not the push — keep the last good ones
-    assert coordinator.data["sensors"] is prior_sensors
+    assert coordinator.data.sensors is prior_sensors
 
 
 async def test_push_status_ignored_before_first_poll(hass: HomeAssistant):
@@ -898,12 +909,110 @@ async def test_phone_app_mode_status_watchdog_marks_silent_device_unavailable(
     entry.add_to_hass(hass)
     coordinator = ILetComfortCoordinator(hass, entry)
     coordinator.async_set_updated_data(
-        {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+        make_state(ITSStatus(mode=1), ITSSensors(), sn8=coordinator.sn8)
     )
 
     coordinator._apply_push_connected(True)
     coordinator._check_push_status_freshness()
 
+    assert coordinator.last_update_success is False
+
+
+async def test_phone_app_mode_atw_connected_push_never_expires_on_silence(
+    hass: HomeAssistant,
+):
+    """ATW units publish no periodic status; a live MQTT link means fresh (#129).
+
+    The Hyundai HPSI-Split (171H120F) sent no 0x01 status pushes and only
+    sporadic 0x04 change notifications, so the 45-minute status heartbeat
+    marked a healthy connection unavailable in every test. ATW availability
+    therefore follows MQTT transport liveness alone.
+    """
+    from custom_components.iletcomfort.const import OPERATION_MODE_PHONE_APP
+
+    entry = _entry_operation_mode(OPERATION_MODE_PHONE_APP)
+    entry.add_to_hass(hass)
+    coordinator = ILetComfortCoordinator(hass, entry)
+    coordinator.appliance_meta = {"sn8": "171H120F"}
+    coordinator.async_set_updated_data(
+        make_state(ITSStatus(mode=1), ITSSensors(), sn8=coordinator.sn8)
+    )
+
+    with patch(
+        "custom_components.iletcomfort.coordinator.async_call_later"
+    ) as call_later:
+        coordinator._apply_push_connected(True)
+        coordinator._apply_push_status(ITSStatus(mode=1))
+
+    call_later.assert_not_called()
+    assert coordinator._push_status_watchdog is None
+
+    coordinator._check_push_status_freshness()
+    assert coordinator.last_update_success is True
+
+    coordinator._apply_push_connected(False)
+    assert coordinator.last_update_success is False
+
+
+async def test_phone_app_mode_watchdog_armed_before_sn8_skips_once_atw_resolves(
+    hass: HomeAssistant,
+):
+    """A heartbeat armed while sn8 was unknown must not expire an ATW unit (#129)."""
+    from custom_components.iletcomfort.const import OPERATION_MODE_PHONE_APP
+
+    entry = _entry_operation_mode(OPERATION_MODE_PHONE_APP)
+    entry.add_to_hass(hass)
+    coordinator = ILetComfortCoordinator(hass, entry)
+    coordinator.async_set_updated_data(
+        make_state(ITSStatus(mode=1), ITSSensors(), sn8=coordinator.sn8)
+    )
+
+    with patch(
+        "custom_components.iletcomfort.coordinator.async_call_later",
+        return_value=lambda: None,
+    ) as call_later:
+        coordinator._apply_push_connected(True)
+        assert call_later.call_count == 1
+
+        coordinator.appliance_meta = {"sn8": "171H120F"}
+        coordinator._check_push_status_freshness()
+
+        assert call_later.call_count == 1
+
+    assert coordinator.last_update_success is True
+    assert coordinator._push_status_watchdog is None
+
+
+async def test_phone_app_mode_status_watchdog_schedules_callback_job(
+    hass: HomeAssistant,
+):
+    """Watchdog timer must run on the event loop, never in an executor (#129)."""
+    from homeassistant.core import HassJobType, is_callback
+
+    from custom_components.iletcomfort.const import OPERATION_MODE_PHONE_APP
+
+    entry = _entry_operation_mode(OPERATION_MODE_PHONE_APP)
+    entry.add_to_hass(hass)
+    coordinator = ILetComfortCoordinator(hass, entry)
+    coordinator.async_set_updated_data(
+        make_state(ITSStatus(mode=1), ITSSensors(), sn8=coordinator.sn8)
+    )
+
+    scheduled_jobs: list = []
+    with patch(
+        "custom_components.iletcomfort.coordinator.async_call_later",
+        side_effect=lambda _hass, _delay, action: (
+            scheduled_jobs.append(action) or (lambda: None)
+        ),
+    ):
+        coordinator._apply_push_connected(True)
+
+    assert len(scheduled_jobs) == 1
+    job = scheduled_jobs[0]
+    assert job.job_type is HassJobType.Callback
+    assert is_callback(job.target)
+
+    job.target(None)
     assert coordinator.last_update_success is False
 
 
@@ -917,7 +1026,7 @@ async def test_phone_app_mode_status_push_recovers_from_status_watchdog(
     entry.add_to_hass(hass)
     coordinator = ILetComfortCoordinator(hass, entry)
     coordinator.async_set_updated_data(
-        {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+        make_state(ITSStatus(mode=1), ITSSensors(), sn8=coordinator.sn8)
     )
 
     coordinator._apply_push_connected(True)
@@ -925,7 +1034,7 @@ async def test_phone_app_mode_status_push_recovers_from_status_watchdog(
     coordinator._apply_push_status(ITSStatus(mode=4))
 
     assert coordinator.last_update_success is True
-    assert coordinator.data["status"].mode == 4
+    assert coordinator.data.status.mode == 4
 
 
 async def test_phone_app_mode_disconnect_is_unavailable_without_polling(
@@ -938,7 +1047,7 @@ async def test_phone_app_mode_disconnect_is_unavailable_without_polling(
     entry.add_to_hass(hass)
     coordinator = ILetComfortCoordinator(hass, entry)
     coordinator.async_set_updated_data(
-        {"status": ITSStatus(mode=1), "sensors": ITSSensors()}
+        make_state(ITSStatus(mode=1), ITSSensors(), sn8=coordinator.sn8)
     )
 
     with patch.object(
@@ -1101,7 +1210,7 @@ async def test_kjrh120l_push_status_latches_zone1_capability(hass: HomeAssistant
 
     coord = _kjrh_poll_coordinator(hass, "17100003", KJRH120L_SNAPSHOT_B)
     await _poll_once(coord)
-    coord.data = {"status": ITSStatus(), "sensors": ITSSensors()}
+    coord.data = make_state(ITSStatus(), ITSSensors(), sn8=coord.sn8)
     assert CONF_KJRH120L_ZONE1_CAPABLE not in coord.entry.data
 
     coord._apply_push_status(decode_its_status(bytearray(KJRH120L_SNAPSHOT_A)))
@@ -1111,15 +1220,15 @@ async def test_kjrh120l_push_status_latches_zone1_capability(hass: HomeAssistant
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "command",
     [
-        {"zone1_temperature": 50},
-        {"zone1_run_mode": 2, "zone1_temperature": 25},
-        {"zone1_power": True},
+        SetZoneTargetCommand(zone=1, temperature=50),
+        SetZoneRunModeCommand(zone=1, mode="cool"),
+        SetZonePowerCommand(zone=1, on=True),
     ],
 )
 async def test_phone_app_mode_rejects_kjrh120l_zone1_writes(
-    hass: HomeAssistant, kwargs
+    hass: HomeAssistant, command
 ):
     from homeassistant.exceptions import HomeAssistantError
 
@@ -1132,13 +1241,14 @@ async def test_phone_app_mode_rejects_kjrh120l_zone1_writes(
     coordinator.appliance_meta = {"sn8": "17100003"}
 
     with pytest.raises(HomeAssistantError, match="HA primary"):
-        await coordinator.async_set_device(**kwargs)
+        await coordinator.async_send_command(command)
 
-    cls.return_value.set_device.assert_not_called()
     cls.return_value.send_hex_command.assert_not_called()
 
 
-async def test_async_set_device_threads_zone1_kwargs_to_client(hass: HomeAssistant):
+async def test_async_send_command_sends_kjrh120l_run_mode_with_clamped_setpoint(
+    hass: HomeAssistant,
+):
     entry = _entry(REGION_US)
     entry.add_to_hass(hass)
     with patch(
@@ -1146,19 +1256,22 @@ async def test_async_set_device_threads_zone1_kwargs_to_client(hass: HomeAssista
     ) as mock_cls:
         coord = ILetComfortCoordinator(hass, entry)
     coord.appliance_meta = {"sn8": "17100003"}
+    coord.data = make_state(
+        _decode_kjrh120l_status(_KJRH120L_SNAPSHOT_A), sn8=coord.sn8
+    )
     coord.async_request_refresh = AsyncMock()
 
-    await coord.async_set_device(zone1_run_mode=2, zone1_temperature=25)
+    await coord.async_send_command(SetZoneRunModeCommand(zone=1, mode="cool"))
 
-    kwargs = mock_cls.return_value.set_device.call_args.kwargs
-    assert kwargs["sn8"] == "17100003"
-    assert kwargs["zone1_run_mode"] == 2
-    assert kwargs["zone1_temperature"] == 25
+    # Snapshot A's 50 C heating target is clamped into the 5-25 C Cool range.
+    assert mock_cls.return_value.send_hex_command.call_args_list == [
+        call("APPL1", "00030102ff00040119ff")
+    ]
     coord.async_request_refresh.assert_awaited_once()
 
 
 @pytest.mark.parametrize("error", [ApiError("code=1214"), ValueError("bad byte")])
-async def test_async_set_device_wraps_write_errors(hass: HomeAssistant, error):
+async def test_async_send_command_wraps_write_errors(hass: HomeAssistant, error):
     from homeassistant.exceptions import HomeAssistantError
 
     entry = _entry(REGION_US)
@@ -1169,16 +1282,16 @@ async def test_async_set_device_wraps_write_errors(hass: HomeAssistant, error):
         coord = ILetComfortCoordinator(hass, entry)
     coord.appliance_meta = {"sn8": "17100003"}
     coord.async_request_refresh = AsyncMock()
-    mock_cls.return_value.set_device.side_effect = error
+    mock_cls.return_value.send_hex_command.side_effect = error
 
-    with pytest.raises(HomeAssistantError) as exc_info:
-        await coord.async_set_device(zone1_temperature=50)
+    with pytest.raises(HomeAssistantError, match="Heat pump command failed") as exc_info:
+        await coord.async_send_command(SetZoneTargetCommand(zone=1, temperature=50))
 
     assert exc_info.value.__cause__ is error
     coord.async_request_refresh.assert_not_awaited()
 
 
-async def test_async_set_device_reauths_then_retries_zone1_write(hass: HomeAssistant):
+async def test_async_send_command_reauths_then_retries_zone1_write(hass: HomeAssistant):
     entry = _entry(REGION_US)
     entry.add_to_hass(hass)
     with patch(
@@ -1189,10 +1302,12 @@ async def test_async_set_device_reauths_then_retries_zone1_write(hass: HomeAssis
     coord.async_request_refresh = AsyncMock()
     coord._async_login = AsyncMock()
     client = mock_cls.return_value
-    client.set_device.side_effect = [AuthError("expired"), {"sent": "00000101ff"}]
+    client.send_hex_command.side_effect = [AuthError("expired"), "ok"]
 
-    await coord.async_set_device(zone1_power=True)
+    await coord.async_send_command(SetZonePowerCommand(zone=1, on=True))
 
     coord._async_login.assert_awaited_once()
-    assert client.set_device.call_count == 2
-    assert client.set_device.call_args.kwargs["zone1_power"] is True
+    assert client.send_hex_command.call_args_list == [
+        call("APPL1", "00000101ff"),
+        call("APPL1", "00000101ff"),
+    ]

@@ -11,7 +11,7 @@ The climate card's ``current_temperature`` is profile-aware (issues #22, #38,
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -28,6 +28,8 @@ from custom_components.iletcomfort.model_profiles import (
     decode_atw_status,
     decode_kjrh120l_status,
 )
+from tests.snapshot_helpers import make_state
+from tests.write_helpers import bind_write_path, sent_commands
 
 
 def _climate(sn8: str | None, sensors: ITSSensors, status: ITSStatus | None = None):
@@ -36,9 +38,9 @@ def _climate(sn8: str | None, sensors: ITSSensors, status: ITSStatus | None = No
     coordinator.appliance_code = "APPL1"
     coordinator.sn8 = sn8
     coordinator.appliance_meta = {"sn8": sn8} if sn8 else None
-    coordinator.data = {"status": status, "sensors": sensors}
-    coordinator.async_set_device = AsyncMock()
-    return ILetComfortClimate(coordinator)
+    coordinator.data = make_state(status, sensors, sn8=sn8)
+    coordinator.c3_basic_controllable = None
+    return ILetComfortClimate(bind_write_path(coordinator))
 
 
 def test_current_temperature_standard_reads_twin_temp():
@@ -133,7 +135,7 @@ async def test_fan_only_rejects_direct_temperature_service_call():
 
     with pytest.raises(HomeAssistantError, match="Fan Only"):
         await entity.async_set_temperature(**{ATTR_TEMPERATURE: 30})
-    entity.coordinator.async_set_device.assert_not_awaited()
+    entity.coordinator.async_execute_plan.assert_not_awaited()
 
 
 def test_heating_keeps_temperature_control_and_40_degree_maximum():
@@ -189,23 +191,21 @@ async def test_kjrh120l_set_temperature_within_range_passes_through():
     """A KJRH setpoint inside the DHW range is forwarded unchanged (as int)."""
     entity = _climate(KJRH120L_SN8, ITSSensors(), ITSStatus(mode=1))
     await entity.async_set_temperature(**{ATTR_TEMPERATURE: 60})
-    entity.coordinator.async_set_device.assert_awaited_once_with(temperature=60)
+    assert sent_commands(entity.coordinator) == ["0007013cff"]
 
 
 async def test_kjrh120l_set_temperature_clamped_to_max():
     """A request above the KJRH max is clamped down to max_temp before sending."""
     entity = _climate(KJRH120L_SN8, ITSSensors(), ITSStatus(mode=1))
     await entity.async_set_temperature(**{ATTR_TEMPERATURE: 99})
-    sent = entity.coordinator.async_set_device.call_args.kwargs["temperature"]
-    assert sent == int(entity.max_temp)
+    assert sent_commands(entity.coordinator) == ["000701%02xff" % int(entity.max_temp)]
 
 
 async def test_kjrh120l_set_temperature_clamped_to_min():
     """A request below the KJRH min is clamped up to min_temp before sending."""
     entity = _climate(KJRH120L_SN8, ITSSensors(), ITSStatus(mode=1))
     await entity.async_set_temperature(**{ATTR_TEMPERATURE: 1})
-    sent = entity.coordinator.async_set_device.call_args.kwargs["temperature"]
-    assert sent == int(entity.min_temp)
+    assert sent_commands(entity.coordinator) == ["000701%02xff" % int(entity.min_temp)]
 
 
 def test_kjrh120l_min_max_cover_captured_setpoints():
@@ -221,6 +221,38 @@ def test_non_kjrh_min_max_unchanged(sn8):
     entity = _climate(sn8, ITSSensors(), ITSStatus(mode=1))  # mode 1 → Heat
     assert entity.min_temp == 10.0
     assert entity.max_temp == 40.0
+
+
+def test_atw_c3_basic_climate_uses_device_bounds_step_and_capabilities():
+    """Read-only ATW units honor C3Basic mode capabilities, bounds, and 0.5 step."""
+    # Water-mode (heat + DHW only, e.g. Hyundai #129 [2]=0x75, heat max=55)
+    water_status = decode_atw_status(
+        bytes.fromhex("0101750003033c1e343037191905371919053c223c141c0080")
+    )
+    water_climate = _climate(ATW_SN8, ITSSensors(), water_status)
+    assert water_climate.target_temperature == 60.0
+    assert water_climate.target_temperature_step == 1.0
+    assert water_climate.hvac_modes == [HVACMode.OFF, HVACMode.HEAT]
+    assert (water_climate.min_temp, water_climate.max_temp) == (25.0, 55.0)
+    assert water_climate.extra_state_attributes["zone1_temp_mode"] == "water"
+
+    # Room-mode ([2]=0x05 heat + DHW, Inventor #125, room range 17.0-30.0)
+    room_status = decode_atw_status(
+        bytes.fromhex("01090511030332283c3c41231905412319053c223c14250080")
+    )
+    room_climate = _climate(ATW_SN8, ITSSensors(), room_status)
+    assert room_climate.target_temperature == 30.0
+    assert room_climate.target_temperature_step == 0.5
+    assert (room_climate.min_temp, room_climate.max_temp) == (17.0, 30.0)
+    assert room_climate.extra_state_attributes["zone1_temp_mode"] == "room"
+
+    # Cool capability + zeroed bounds fall back to Cooling profile bounds (12-40).
+    cool_cap_zero_limits = decode_atw_status(
+        bytes.fromhex("010117000203231e2c3000000000371919053c223c142c0080")
+    )
+    cool_climate = _climate(ATW_SN8, ITSSensors(), cool_cap_zero_limits)
+    assert cool_climate.hvac_modes == [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL]
+    assert (cool_climate.min_temp, cool_climate.max_temp) == (12.0, 40.0)
 
 
 def test_kjrh120l_min_max_widened_to_20_70():
@@ -261,7 +293,7 @@ async def test_kjrh120l_dual_climate_rejects_unvalidated_writes(method, kwargs):
     entity = _climate(KJRH120L_SN8, ITSSensors(), _dual_kjrh_status())
     with pytest.raises(HomeAssistantError, match="Zone-1 control"):
         await getattr(entity, method)(**kwargs)
-    entity.coordinator.async_set_device.assert_not_awaited()
+    entity.coordinator.async_execute_plan.assert_not_awaited()
 
 
 # --- KJRH-120L power read-back → hvac_mode (issue #35) --------------------
