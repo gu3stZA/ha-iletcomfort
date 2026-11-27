@@ -17,27 +17,23 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import ITSStatus
+from .commands import SetDhwTargetCommand, SetZoneTargetCommand
 from .const import DOMAIN
 from .coordinator import ILetComfortCoordinator
 from .entity import async_add_kjrh120l_zone1_entities, build_device_info
 from .model_profiles import (
     KJRH120L_DHW_TEMP_MAX,
     KJRH120L_DHW_TEMP_MIN,
-    ModelProfile,
-    kjrh120l_has_zone1,
-    kjrh120l_zone1_range,
-    resolve_profile,
 )
+from .protocols import is_kjrh120l_dual_state
 
 
 def _is_kjrh120l_dual(coordinator: ILetComfortCoordinator) -> bool:
-    if resolve_profile(coordinator.sn8) is not ModelProfile.KJRH120L:
-        return False
-    if coordinator.kjrh120l_zone1_capable is True:
-        return True
-    status = (coordinator.data or {}).get("status")
-    return bool(status and kjrh120l_has_zone1(status.raw_body))
+    return is_kjrh120l_dual_state(
+        coordinator.sn8,
+        coordinator.data,
+        coordinator.kjrh120l_zone1_capable is True,
+    )
 
 
 async def async_setup_entry(
@@ -84,22 +80,15 @@ class ILetComfortKjrh120lDhwSetpoint(
 
     @property
     def native_value(self) -> float | None:
-        status = (self.coordinator.data or {}).get("status")
-        if status is None:
-            return None
-        if status.kjrh120l_dhw_setpoint is not None:
-            return status.kjrh120l_dhw_setpoint
-        # When Zone 1 is off (body[8:10] == 00 00), decode_kjrh120l_status
-        # leaves body[15] (the DHW setpoint) in t5s_def so pure-DHW units
-        # keep their existing single-setpoint behavior.
-        return status.t5s_def
+        state = self.coordinator.data
+        return state.dhw_target_temp if state is not None else None
 
     async def async_set_native_value(self, value: float) -> None:
         clamped = max(
             self._attr_native_min_value,
             min(float(value), self._attr_native_max_value),
         )
-        await self.coordinator.async_set_device(temperature=int(clamped))
+        await self.coordinator.async_send_command(SetDhwTargetCommand(clamped))
 
 
 class ILetComfortKjrh120lZone1Setpoint(
@@ -125,13 +114,9 @@ class ILetComfortKjrh120lZone1Setpoint(
         self._attr_device_info = build_device_info(coordinator)
 
     @property
-    def _status(self) -> ITSStatus | None:
-        return (self.coordinator.data or {}).get("status")
-
-    @property
     def _range(self) -> tuple[int, int] | None:
-        status = self._status
-        return kjrh120l_zone1_range(status) if status is not None else None
+        state = self.coordinator.data
+        return state.zone1_target_range if state is not None else None
 
     @property
     def available(self) -> bool:
@@ -143,8 +128,8 @@ class ILetComfortKjrh120lZone1Setpoint(
 
     @property
     def native_value(self) -> float | None:
-        status = self._status
-        return status.kjrh120l_zone1_setpoint if status is not None else None
+        state = self.coordinator.data
+        return state.zone1_target_temp if state is not None else None
 
     @property
     def native_min_value(self) -> float:
@@ -172,4 +157,6 @@ class ILetComfortKjrh120lZone1Setpoint(
             raise HomeAssistantError(
                 f"Zone 1 target {value:g} is outside the reported range {low}-{high}"
             )
-        await self.coordinator.async_set_device(zone1_temperature=int(value))
+        await self.coordinator.async_send_command(
+            SetZoneTargetCommand(zone=1, temperature=int(value))
+        )

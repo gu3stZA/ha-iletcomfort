@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import requests
@@ -264,7 +264,15 @@ async def test_empty_appliance_list_shows_no_devices(hass: HomeAssistant):
     assert result["errors"] == {"base": "no_devices"}
 
 
-async def test_device_step_creates_entry_with_full_data(hass: HomeAssistant):
+@pytest.fixture
+async def mock_entry_setup(hass: HomeAssistant):
+    """Keep the config flow's background entry setup off the network."""
+    with patch("custom_components.iletcomfort.async_setup_entry", new=AsyncMock(return_value=True)):
+        yield
+        await hass.async_block_till_done()
+
+
+async def test_device_step_creates_entry_with_full_data(hass: HomeAssistant, mock_entry_setup):
     """Picking a device must create an entry with email/password/region/code."""
     patcher, _, _ = _patch_client(appliances=ONE_APPLIANCE)
     with patcher:
@@ -294,7 +302,7 @@ async def test_device_step_creates_entry_with_full_data(hass: HomeAssistant):
     }
 
 
-async def test_device_step_unique_id_is_email_plus_code(hass: HomeAssistant):
+async def test_device_step_unique_id_is_email_plus_code(hass: HomeAssistant, mock_entry_setup):
     """Unique ID format must be '<lowercase email>:<appliance code>'."""
     patcher, _, _ = _patch_client(appliances=ONE_APPLIANCE)
     with patcher:
@@ -319,7 +327,7 @@ async def test_device_step_unique_id_is_email_plus_code(hass: HomeAssistant):
 
 
 async def test_multi_device_account_can_add_each_device_separately(
-    hass: HomeAssistant,
+    hass: HomeAssistant, mock_entry_setup,
 ):
     """Two devices on the same account → two entries with different unique IDs."""
     patcher, _, _ = _patch_client(appliances=TWO_APPLIANCES)

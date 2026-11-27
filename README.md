@@ -51,7 +51,9 @@ only if the cloud rejects that token, which may briefly sign the phone app out o
 per certificate lifetime. If MQTT disconnects, HA marks the entities unavailable
 instead of taking over the account session. Valid C3 status pushes also refresh
 an end-to-end device liveness watchdog; the observed idle cadence is about 15
-minutes, with a 45-minute tolerance for missed cycles. Use **HA is the primary
+minutes, with a 45-minute tolerance for missed cycles. Air-to-water units
+(`sn8 171H120F`) publish status only on change, so for them availability follows
+the MQTT connection alone. Use **HA is the primary
 client** (the default) when Home Assistant must control the heat pump.
 
 ## Showing water temperatures on a dashboard
@@ -88,6 +90,40 @@ cards:
 This uses only core dashboard cards and therefore works in the web and mobile
 apps. If a model does not provide a trustworthy reading, its sensor appears as
 unavailable rather than displaying a guessed value.
+
+## `171H120F` units (KJRH-120F controller, e.g. Rotenso Aquami)
+
+Units whose diagnostics show `sn8` **`171H120F`** report the standard Midea C3
+status layout. They get a read-only **Hot Water** entity, and the **Heat Pump**
+climate shows Zone-1 Heat/Off. The climate attributes `zone1_water_target` and
+`room_target` show both setpoint fields the unit reports; please mention which
+one matches the official app when you report an issue (#124).
+
+**Control (experimental, opt-in).** Standard Midea C3 commands were validated
+on a Rotenso Aquami (EU account) and extended for room-temperature control and
+Silent Level 1/2. To use them, open the integration's **Configure** dialog and
+enable *Enable standard Midea C3 control* — only if the displayed setpoint
+(`zone1_water_target` in water mode, or `room_target` in room mode) matches the
+official app. Then:
+
+| Entity | What it does |
+|---|---|
+| **Heat Pump** (climate) | Zone-1 Heat/Off and water or room (0.5 °C) setpoint (limits come from the unit) |
+| **Zone 2** (climate) | Zone-2 Heat/Off and water setpoint (added automatically on dual-zone units) |
+| **Hot Water** (water heater) | DHW on/off and target temperature (when supported by the unit) |
+| **Fast DHW** (switch) | Fast DHW boost on/off (when supported by the unit) |
+| **Weather Curve** / **Zone 2 Weather Curve** (switches) | Zone-1 (and Zone-2 on dual-zone units) weather-compensation curve on/off |
+| **Silent Mode** (select / switch) | Off, Level 1, or Level 2 (Super Silent) via `select.*_silent_mode`, or on/off via `switch.*_silent_mode`; the unit's own schedules are kept |
+| **ECO Mode** (switch) | On/off (reads live `0x07` ECO state when supported); the unit's own schedules are kept |
+
+> **Note:** Do not use `switch.*_boost` on `171H120F` units — it uses the
+> legacy 62-byte ITS command format (use **Fast DHW** instead).
+
+Every command re-reads the current status first and changes only the
+requested field; commands are sent one at a time. Not supported: switching
+the operating mode, and cooling writes (a unit in Cool mode is shown as Cool,
+but Heat and setpoint changes are refused). Control requires the **HA is the
+primary client** operation mode.
 
 ## Troubleshooting & reporting issues
 

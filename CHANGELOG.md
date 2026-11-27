@@ -1,5 +1,89 @@
 # Changelog
 
+## [0.33.3](https://github.com/tgenov/ha-iletcomfort/compare/v0.33.2...v0.33.3) (2026-11-26)
+
+
+### Bug Fixes
+
+* **atw:** ignore sentinel 0x10 energy counters to protect HA energy statistics ([#232](https://github.com/tgenov/ha-iletcomfort/issues/232)) ([#233](https://github.com/tgenov/ha-iletcomfort/issues/233)) ([00cb4a3](https://github.com/tgenov/ha-iletcomfort/commit/00cb4a3c7aa02d7122ae9c9a82ec07696256ca18))
+
+## [0.33.2](https://github.com/tgenov/ha-iletcomfort/compare/v0.33.1...v0.33.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* **coordinator:** preserve ATW subtype overlays on MQTT status push ([#225](https://github.com/tgenov/ha-iletcomfort/issues/225)) ([#228](https://github.com/tgenov/ha-iletcomfort/issues/228)) ([bd8e6b9](https://github.com/tgenov/ha-iletcomfort/commit/bd8e6b915b7d8e28dd351a63741e877db0db96dc))
+
+## [0.33.1](https://github.com/tgenov/ha-iletcomfort/compare/v0.33.0...v0.33.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* follow MQTT link liveness for ATW units in phone-app mode ([#226](https://github.com/tgenov/ha-iletcomfort/issues/226)) ([ed8403a](https://github.com/tgenov/ha-iletcomfort/commit/ed8403aaf440e8fba3c1d48e4ba7daa4431dad9d))
+
+## [0.33.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.32.1...v0.33.0) (2026-11-26)
+
+
+### Features
+
+* handle ATW MQTT 0x04 energy pushes and suppress fake pressure zeros ([#217](https://github.com/tgenov/ha-iletcomfort/issues/217)) ([a7442c0](https://github.com/tgenov/ha-iletcomfort/commit/a7442c090c57c3cbe212e8b022e8fe64bac16d90))
+
+## [0.32.1](https://github.com/tgenov/ha-iletcomfort/compare/v0.32.0...v0.32.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* prevent ATW zero-energy resets on transient 0x10 errors and add total thermal energy ([#211](https://github.com/tgenov/ha-iletcomfort/issues/211)) ([cfbfe2a](https://github.com/tgenov/ha-iletcomfort/commit/cfbfe2ab8961c6312187a68c1beae4f878631f32))
+
+## [0.32.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.31.0...v0.32.0) (2026-11-26)
+
+
+### Features
+
+* add dual-zone ATW (171H120F) Zone 2 climate and curve support ([#208](https://github.com/tgenov/ha-iletcomfort/issues/208)) ([3462494](https://github.com/tgenov/ha-iletcomfort/commit/34624945b4478859572046b9663d5c25246b467f))
+
+## [0.31.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.30.0...v0.31.0) (2026-11-26)
+
+
+### Features
+
+* extend opt-in ATW (171H120F) C3 basic control ([#206](https://github.com/tgenov/ha-iletcomfort/issues/206)) ([3a6221e](https://github.com/tgenov/ha-iletcomfort/commit/3a6221e051cac51d3646960967ed0b1b0292b19a))
+
+## [0.30.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.29.0...v0.30.0) (2026-11-26)
+
+
+### Features
+
+* **atw:** unify 171H120F C3BasicStatus read decoding across all masks ([#204](https://github.com/tgenov/ha-iletcomfort/issues/204)) ([56ad33f](https://github.com/tgenov/ha-iletcomfort/commit/56ad33f716fefb5d5096de2990d65be07f40a6f4))
+
+## [0.29.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.28.0...v0.29.0) (2026-11-26)
+
+
+### Features
+
+* **atw:** probe and decode 0x05 Silent/Super-Silent and 0x07 ECO ([#201](https://github.com/tgenov/ha-iletcomfort/issues/201)) ([49665c4](https://github.com/tgenov/ha-iletcomfort/commit/49665c4150b9b584a196b39cc87ffdd28b9e5296))
+
+## [0.28.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.27.1...v0.28.0) (2026-11-26)
+
+
+### Features
+
+* opt-in control of 171H120F units via standard Midea C3 SET ([#42](https://github.com/tgenov/ha-iletcomfort/issues/42)) ([#143](https://github.com/tgenov/ha-iletcomfort/issues/143)) ([3e6fc2b](https://github.com/tgenov/ha-iletcomfort/commit/3e6fc2b87d8be423b68f86423aefdcbbf69706f7))
+
+## [0.27.1](https://github.com/tgenov/ha-iletcomfort/compare/v0.27.0...v0.27.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **coordinator,atw:** fix MQTT watchdog callback thread-safety and Cool-tag schedule placeholders ([#199](https://github.com/tgenov/ha-iletcomfort/issues/199)) ([c370641](https://github.com/tgenov/ha-iletcomfort/commit/c370641160fa5bdeaf0e110137c2703cb18fd820))
+
+## [0.27.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.26.0...v0.27.0) (2026-11-26)
+
+
+### Features
+
+* **kjrh120l:** add DHW power switch for dual Zone-1 units ([#196](https://github.com/tgenov/ha-iletcomfort/issues/196)) ([debf4e1](https://github.com/tgenov/ha-iletcomfort/commit/debf4e1f183c4dbc32206a10a499e87ac472f0ad))
+
 ## [0.26.0](https://github.com/tgenov/ha-iletcomfort/compare/v0.25.0...v0.26.0) (2026-11-26)
 
 

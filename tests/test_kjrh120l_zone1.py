@@ -17,7 +17,12 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.iletcomfort.api import ITSSensors, decode_its_status
+from custom_components.iletcomfort.api import (
+    ILetComfortClient,
+    ITSSensors,
+    decode_its_status,
+)
+from custom_components.iletcomfort.commands import SetDhwPowerCommand
 from custom_components.iletcomfort.const import (
     CONF_APPLIANCE_CODE,
     CONF_KJRH120L_ZONE1_CAPABLE,
@@ -32,9 +37,19 @@ from custom_components.iletcomfort.model_profiles import (
     resolve_profile,
 )
 from custom_components.iletcomfort.number import ILetComfortKjrh120lZone1Setpoint
+from custom_components.iletcomfort.protocols import (
+    WriteContext,
+    get_adapter,
+    run_write_plan,
+)
 from custom_components.iletcomfort.select import ILetComfortKjrh120lModeSelect
-from custom_components.iletcomfort.switch import ILetComfortKjrh120lZone1PowerSwitch
+from custom_components.iletcomfort.switch import (
+    ILetComfortKjrh120lDhwPowerSwitch,
+    ILetComfortKjrh120lZone1PowerSwitch,
+)
 from tests.kjrh120l_snapshots import KJRH120L_SNAPSHOT_A, KJRH120L_SNAPSHOT_B
+from tests.write_helpers import bind_write_path, sent_commands
+from tests.snapshot_helpers import make_state
 
 
 def _with(body: bytes, **index_values: int) -> bytes:
@@ -49,12 +64,9 @@ def _coordinator(body: bytes) -> MagicMock:
     coordinator.appliance_code = "APPL1"
     coordinator.sn8 = KJRH120L_SN8
     coordinator.last_update_success = True
-    coordinator.data = {
-        "status": decode_kjrh120l_status(body),
-        "sensors": ITSSensors(),
-    }
-    coordinator.async_set_device = AsyncMock()
-    return coordinator
+    coordinator.data = make_state(decode_kjrh120l_status(body), ITSSensors(), sn8=KJRH120L_SN8)
+    coordinator.c3_basic_controllable = None
+    return bind_write_path(coordinator, kjrh120l_zone1_latched=True)
 
 
 # --- Zone 1 target number ---------------------------------------------------
@@ -86,9 +98,7 @@ async def test_zone1_number_writes_field_04(value, expected):
 
     await entity.async_set_native_value(value)
 
-    entity.coordinator.async_set_device.assert_awaited_once_with(
-        zone1_temperature=expected
-    )
+    assert sent_commands(entity.coordinator) == ["000401%02xff" % expected]
 
 
 @pytest.mark.parametrize("value", [34, 76, 50.5, float("nan")])
@@ -98,7 +108,7 @@ async def test_zone1_number_refuses_values_outside_reported_range(value):
     with pytest.raises(HomeAssistantError):
         await entity.async_set_native_value(value)
 
-    entity.coordinator.async_set_device.assert_not_awaited()
+    entity.coordinator.async_execute_plan.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -118,7 +128,7 @@ async def test_zone1_number_unavailable_and_refuses_without_valid_range(body):
     with pytest.raises(HomeAssistantError):
         await entity.async_set_native_value(50)
 
-    entity.coordinator.async_set_device.assert_not_awaited()
+    entity.coordinator.async_execute_plan.assert_not_awaited()
 
 
 async def test_zone1_number_follows_live_status_without_caching():
@@ -127,10 +137,7 @@ async def test_zone1_number_follows_live_status_without_caching():
     entity = ILetComfortKjrh120lZone1Setpoint(coordinator)
     assert entity.native_value == 50.0
 
-    coordinator.data = {
-        "status": decode_kjrh120l_status(_with(KJRH120L_SNAPSHOT_A, b11=2, b12=20)),
-        "sensors": ITSSensors(),
-    }
+    coordinator.data = make_state(decode_kjrh120l_status(_with(KJRH120L_SNAPSHOT_A, b11=2, b12=20)), ITSSensors(), sn8=KJRH120L_SN8)
 
     assert entity.native_value == 20.0
     assert entity.native_max_value == 25.0
@@ -173,9 +180,7 @@ async def test_mode_select_heat_to_cool_sends_cool_range_target_not_heat_target(
 
     await entity.async_select_option("cool")
 
-    entity.coordinator.async_set_device.assert_awaited_once_with(
-        zone1_run_mode=2, zone1_temperature=25
-    )
+    assert sent_commands(entity.coordinator) == ["00030102ff00040119ff"]
 
 
 async def test_mode_select_cool_to_heat_clamps_up_to_heat_minimum():
@@ -185,9 +190,7 @@ async def test_mode_select_cool_to_heat_clamps_up_to_heat_minimum():
 
     await entity.async_select_option("heat")
 
-    entity.coordinator.async_set_device.assert_awaited_once_with(
-        zone1_run_mode=3, zone1_temperature=35
-    )
+    assert sent_commands(entity.coordinator) == ["00030103ff00040123ff"]
 
 
 async def test_mode_select_heat_keeps_setpoint_inside_heat_range():
@@ -195,9 +198,7 @@ async def test_mode_select_heat_keeps_setpoint_inside_heat_range():
 
     await entity.async_select_option("heat")
 
-    entity.coordinator.async_set_device.assert_awaited_once_with(
-        zone1_run_mode=3, zone1_temperature=50
-    )
+    assert sent_commands(entity.coordinator) == ["00030103ff00040132ff"]
 
 
 @pytest.mark.parametrize(
@@ -214,7 +215,7 @@ async def test_mode_select_refuses_without_setpoint_or_destination_range(body):
     with pytest.raises(HomeAssistantError):
         await entity.async_select_option("cool")
 
-    entity.coordinator.async_set_device.assert_not_awaited()
+    entity.coordinator.async_execute_plan.assert_not_awaited()
 
 
 async def test_mode_select_refuses_unknown_option():
@@ -223,7 +224,7 @@ async def test_mode_select_refuses_unknown_option():
     with pytest.raises(HomeAssistantError):
         await entity.async_select_option("auto")
 
-    entity.coordinator.async_set_device.assert_not_awaited()
+    entity.coordinator.async_execute_plan.assert_not_awaited()
 
 
 def test_mode_select_keeps_previous_unique_id_and_name():
@@ -251,12 +252,7 @@ async def test_zone1_power_switch_writes_field_00():
     await entity.async_turn_on()
     await entity.async_turn_off()
 
-    assert entity.coordinator.async_set_device.await_args_list[0].kwargs == {
-        "zone1_power": True
-    }
-    assert entity.coordinator.async_set_device.await_args_list[1].kwargs == {
-        "zone1_power": False
-    }
+    assert sent_commands(entity.coordinator) == ["00000101ff", "00000100ff"]
 
 
 def test_zone1_power_switch_keeps_previous_unique_id_and_name():
@@ -266,12 +262,60 @@ def test_zone1_power_switch_keeps_previous_unique_id_and_name():
     assert entity.name == "Zone 1 Power"
 
 
+# --- DHW power switch ---------------------------------------------------------
+
+
+def test_dhw_power_switch_reads_body10_and_handles_truncated_or_none():
+    on = ILetComfortKjrh120lDhwPowerSwitch(_coordinator(KJRH120L_SNAPSHOT_A))
+    off = ILetComfortKjrh120lDhwPowerSwitch(
+        _coordinator(_with(KJRH120L_SNAPSHOT_A, b10=0))
+    )
+    short = ILetComfortKjrh120lDhwPowerSwitch(_coordinator(KJRH120L_SNAPSHOT_A[:10]))
+    no_data_coord = _coordinator(KJRH120L_SNAPSHOT_A)
+    no_data_coord.data = None
+    no_data = ILetComfortKjrh120lDhwPowerSwitch(no_data_coord)
+
+    assert on.is_on is True
+    assert off.is_on is False
+    assert short.is_on is None
+    assert no_data.is_on is None
+
+
+async def test_dhw_power_switch_writes_mode_on_off():
+    entity = ILetComfortKjrh120lDhwPowerSwitch(_coordinator(KJRH120L_SNAPSHOT_A))
+
+    await entity.async_turn_on()
+    await entity.async_turn_off()
+
+    assert sent_commands(entity.coordinator) == ["00020101ff", "00020100ff"]
+
+
+def test_dhw_power_switch_unique_id_and_name():
+    entity = ILetComfortKjrh120lDhwPowerSwitch(_coordinator(KJRH120L_SNAPSHOT_A))
+
+    assert entity.unique_id == "APPL1_kjrh120l_dhw_power"
+    assert entity.name == "DHW Power"
+
+
+def test_client_kjrh120l_dhw_power_commands():
+    client = ILetComfortClient(api_base="https://us.dollin.net")
+    adapter = get_adapter(KJRH120L_SN8)
+    with patch.object(client, "send_hex_command", return_value="") as mock_send:
+        for on in (True, False):
+            plan = adapter.plan_write(SetDhwPowerCommand(on=on), WriteContext())
+            run_write_plan(plan, lambda hex_: client.send_hex_command("APPL1", hex_))
+
+    assert mock_send.call_args_list[0].args == ("APPL1", "00020101ff")
+    assert mock_send.call_args_list[1].args == ("APPL1", "00020100ff")
+
+
 # --- Platform setup and the capability latch ----------------------------------
 
 _NEW_ENTITIES = (
     ("number", "APPL1_kjrh120l_zone1_setpoint"),
     ("select", "APPL1_kjrh120l_mode"),
     ("switch", "APPL1_kjrh120l_zone1_power"),
+    ("switch", "APPL1_kjrh120l_dhw_power"),
 )
 
 
@@ -358,6 +402,7 @@ async def test_dual_unit_gets_entities_at_setup_and_latches_without_reload(
     assert hass.states.get(ids["APPL1_kjrh120l_zone1_setpoint"]).state == "50.0"
     assert hass.states.get(ids["APPL1_kjrh120l_mode"]).state == "heat"
     assert hass.states.get(ids["APPL1_kjrh120l_zone1_power"]).state == STATE_ON
+    assert hass.states.get(ids["APPL1_kjrh120l_dhw_power"]).state == STATE_ON
     assert _existing_entities_present(hass)
 
 
@@ -398,6 +443,7 @@ async def test_latched_unit_restarting_with_zone_off_keeps_entities_available(
     ids = _entity_ids(hass)
     assert all(ids.values())
     assert hass.states.get(ids["APPL1_kjrh120l_zone1_power"]).state == STATE_OFF
+    assert hass.states.get(ids["APPL1_kjrh120l_dhw_power"]).state == STATE_ON
     assert hass.states.get(ids["APPL1_kjrh120l_zone1_setpoint"]).state == "37.0"
     assert hass.states.get(ids["APPL1_kjrh120l_mode"]).state == "heat"
 
@@ -424,6 +470,7 @@ async def test_zone_switched_off_after_setup_keeps_entities_available(
 
     ids = _entity_ids(hass)
     assert hass.states.get(ids["APPL1_kjrh120l_zone1_power"]).state == STATE_OFF
+    assert hass.states.get(ids["APPL1_kjrh120l_dhw_power"]).state == STATE_ON
     assert hass.states.get(ids["APPL1_kjrh120l_zone1_setpoint"]).state == "37.0"
     assert entry.data[CONF_KJRH120L_ZONE1_CAPABLE] is True
 

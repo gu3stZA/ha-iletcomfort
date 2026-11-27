@@ -128,14 +128,13 @@ jobs:
         # Same setup as the project's own tests.yml.
         uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          python-version-file: .python-version
 
       - name: Run tests
         if: steps.up.outputs.needed == 'true'
         run: |
-          uv venv
-          uv pip install -r requirements_test.txt
-          uv run pytest tests/ -q
+          uv sync --locked
+          uv run --no-sync pytest tests/ -q
 
       - name: Push and publish release
         if: steps.up.outputs.needed == 'true' && !inputs.dry_run && github.ref_name == github.event.repository.default_branch

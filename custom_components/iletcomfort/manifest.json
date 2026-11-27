@@ -12,5 +12,5 @@
     "paho-mqtt>=1.6",
     "msmart-ng>=2025.1.0"
   ],
-  "version": "0.26.0"
+  "version": "0.33.3"
 }
