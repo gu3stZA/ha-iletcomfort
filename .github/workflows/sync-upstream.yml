@@ -6,8 +6,9 @@
 # here (vX.Y.Z.N = upstream X.Y.Z + local mode, N counts our own builds), which
 # Home Assistant's HACS/Marketplace then offers as an update.
 #
-# If the branch already holds the upstream tag (merged by hand) but no
-# vX.Y.Z.N release exists for it, the run tests and publishes that release.
+# Also test and publish local integration changes on the fork's default branch.
+# Compare the installable files with the most recent published fork build so
+# documentation edits, retries and scheduled runs do not cut duplicate releases.
 #
 # On a merge conflict or a failing test nothing is pushed: the working branch
 # stays as it was and an issue is opened in this fork. Note: GITHUB_TOKEN
@@ -16,6 +17,12 @@
 name: Sync upstream release
 
 on:
+  push:
+    branches: [feat/local-lan-transport]
+    paths:
+      - custom_components/iletcomfort/**
+      - hacs.json
+      - .github/workflows/sync-upstream.yml
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -35,8 +42,7 @@ concurrency:
 
 env:
   UPSTREAM: tgenov/ha-iletcomfort
-  # Scheduled runs use the default branch (feat/local-lan-transport); a manual
-  # run syncs whichever branch it was started on.
+  # A manual run can test a different branch; only the default branch publishes.
   BRANCH: ${{ github.ref_name }}
 
 jobs:
@@ -52,31 +58,51 @@ jobs:
 
       - name: Find latest upstream release
         id: up
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           git fetch --no-tags "https://github.com/$UPSTREAM.git" \
             "+refs/tags/$tag:refs/tags/upstream-$tag"
-          # A release here is vX.Y.Z.N for upstream vX.Y.Z.
-          pattern="^v$(printf '%s' "${tag#v}" | sed 's/\./\\./g')\.[0-9]+$"
-          released=false
-          if gh release list --limit 100 --json tagName -q '.[].tagName' | grep -Eq "$pattern"; then
-            released=true
-          fi
+          # Read all published stable releases; tags alone may have no HACS release.
+          base="v${tag#v}"
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | [.tag_name, (if .draft or .prerelease then "reserved" else "stable" end)] | @tsv')
+          latest=$(printf '%s\n' "$releases" | awk -v prefix="$base." \
+            '$2 == "stable" && index($1, prefix) == 1 && substr($1, length(prefix)+1) ~ /^[0-9]+$/ { print $1 }' \
+            | sort -V | tail -n 1)
+          merge=false
+          needed=true
           if ! git merge-base --is-ancestor "upstream-$tag" HEAD; then
-            echo "Upstream $tag is new; merging."
-            echo "merge=true" >> "$GITHUB_OUTPUT"
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-          elif [ "$released" = false ]; then
-            # Merged by hand (e.g. after a conflict) but not released yet.
-            echo "Already contains upstream $tag but no release exists; releasing."
-            echo "merge=false" >> "$GITHUB_OUTPUT"
-            echo "needed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Already contains and released upstream $tag; nothing to do."
-            echo "merge=false" >> "$GITHUB_OUTPUT"
-            echo "needed=false" >> "$GITHUB_OUTPUT"
+            merge=true
+          elif [[ -n "$latest" ]]; then
+            needed=false
+            # Only the default branch publishes fork-only changes.
+            if [[ "$BRANCH" == "$DEFAULT_BRANCH" ]]; then
+              git fetch --no-tags origin "refs/tags/$latest"
+              previous=$(git rev-parse 'FETCH_HEAD^{commit}')
+              if git diff --quiet "$previous" HEAD -- custom_components/iletcomfort hacs.json; then
+                echo "Installable files match $latest."
+              else
+                diff_status=$?
+                [[ "$diff_status" == 1 ]] || exit "$diff_status"
+                git merge-base --is-ancestor "$previous" HEAD
+                needed=true
+              fi
+            fi
           fi
+          # A draft, prerelease or bare tag may already occupy the next suffix.
+          refs=$(git ls-remote --refs --tags origin "refs/tags/$base.*")
+          highest=$({
+            printf '%s\n' "$releases" | cut -f1
+            printf '%s\n' "$refs" | sed -n 's|.*refs/tags/||p'
+          } | awk -v prefix="$base." 'index($0, prefix) == 1 {
+            n = substr($0, length(prefix)+1); if (n ~ /^[0-9]+$/ && n+0 > max) max=n+0
+          } END { print max+0 }')
+          echo "fork_tag=$base.$((highest + 1))" >> "$GITHUB_OUTPUT"
+          echo "merge=$merge" >> "$GITHUB_OUTPUT"
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
 
       - name: Merge upstream release
         if: steps.up.outputs.merge == 'true'
@@ -102,18 +128,18 @@ jobs:
           uv run pytest tests/ -q
 
       - name: Push and publish release
-        if: steps.up.outputs.needed == 'true' && !inputs.dry_run
+        if: steps.up.outputs.needed == 'true' && !inputs.dry_run && github.ref_name == github.event.repository.default_branch
         env:
           TAG: ${{ steps.up.outputs.tag }}
+          FORK_TAG: ${{ steps.up.outputs.fork_tag }}
         run: |
           git push origin "HEAD:$BRANCH"
-          base="${TAG#v}"
-          n=1
-          while gh release view "v$base.$n" >/dev/null 2>&1; do n=$((n + 1)); done
-          gh release create "v$base.$n" \
-            --target "$(git rev-parse HEAD)" \
-            --title "v$base.$n (upstream $TAG + local LAN mode)" \
-            --notes "Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) merged with this fork's local LAN connection mode. Tests passed in run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+          git push --force-with-lease="refs/tags/$FORK_TAG:" origin "HEAD:refs/tags/$FORK_TAG"
+          gh release create "$FORK_TAG" \
+            --verify-tag \
+            --title "$FORK_TAG (upstream $TAG + local LAN mode)" \
+            --generate-notes \
+            --notes "Based on upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG). Tests passed in run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
 
       - name: Report failure
         if: failure() && !inputs.dry_run
@@ -125,7 +151,7 @@ jobs:
             echo "An open issue already tracks this failure."
             exit 0
           fi
-          gh issue create --title "$title" --body "The scheduled sync could not merge or verify upstream ${TAG:-release}. Nothing was pushed; the installed version is unchanged.
+          gh issue create --title "$title" --body "The workflow could not complete the sync, tests or release for upstream ${TAG:-release}. Check the run log, branch and tags before retrying.
 
           Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
