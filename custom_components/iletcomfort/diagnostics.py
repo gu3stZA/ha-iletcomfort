@@ -18,16 +18,16 @@ from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 
 from .api import SENSOR_DISCONNECTED, TEMP_OFFSET, mask_identifier
-from .const import CONF_APPLIANCE_CODE, DOMAIN
+from .const import CONF_APPLIANCE_CODE, CONF_LOCAL_KEY, CONF_LOCAL_TOKEN, DOMAIN
 from .coordinator import ILetComfortCoordinator
 from .model_profiles import ModelProfile, atw_sensors_are_placeholder
 from .protocols import get_adapter
 
-# Account credentials are the only secrets in the entry. Region is kept as-is.
+# Redact cloud credentials and saved LAN credentials, including in cloud mode.
 # appliance_code is a device-unique identifier, so it is suffix-masked (see
 # mask_identifier) rather than left intact — sn8 already covers model
 # correlation, so the maintainer loses nothing by not seeing the full code.
-TO_REDACT = {CONF_EMAIL, CONF_PASSWORD}
+TO_REDACT = {CONF_EMAIL, CONF_PASSWORD, CONF_LOCAL_TOKEN, CONF_LOCAL_KEY}
 
 # Appliance metadata is surfaced to help maintainers identify the device class
 # for model-specific decoding (issue #22). Redact the account/device-identifying

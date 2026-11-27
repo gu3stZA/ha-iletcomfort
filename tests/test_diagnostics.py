@@ -12,6 +12,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.iletcomfort.api import ITSSensors, ITSStatus
 from custom_components.iletcomfort.const import (
     CONF_APPLIANCE_CODE,
+    CONF_LOCAL_KEY,
+    CONF_LOCAL_TOKEN,
     CONF_REGION,
     DOMAIN,
     REGION_US,
@@ -36,6 +38,7 @@ def _entry() -> MockConfigEntry:
             CONF_APPLIANCE_CODE: APPLIANCE_CODE,
             CONF_REGION: REGION_US,
         },
+        options={CONF_LOCAL_TOKEN: "test-lan-token", CONF_LOCAL_KEY: "test-lan-key"},
         version=2,
     )
 
@@ -66,6 +69,10 @@ async def test_diagnostics_redacts_credentials(hass: HomeAssistant):
     # appliance_code is a device-unique id: suffix-masked, never the full value.
     assert entry_data[CONF_APPLIANCE_CODE] == "15393…"
     assert APPLIANCE_CODE not in json.dumps(result)
+    options = result["entry"]["options"]
+    for key, value in ((CONF_LOCAL_TOKEN, "test-lan-token"), (CONF_LOCAL_KEY, "test-lan-key")):
+        assert options[key] == "**REDACTED**"
+        assert value not in json.dumps(result)
 
 
 async def test_diagnostics_serializes_raw_frames_as_hex(hass: HomeAssistant):
