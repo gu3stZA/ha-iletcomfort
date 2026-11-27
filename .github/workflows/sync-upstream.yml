@@ -61,10 +61,20 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            # Release the version this fork actually runs. A newer upstream
+            # release may need a separate, manually resolved merge.
+            version=$(jq -er '.version' custom_components/iletcomfort/manifest.json)
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            tag="v$version"
+          else
+            tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          git fetch --no-tags "https://github.com/$UPSTREAM.git" \
-            "+refs/tags/$tag:refs/tags/upstream-$tag"
+          if [[ "$GITHUB_EVENT_NAME" != push ]]; then
+            git fetch --no-tags "https://github.com/$UPSTREAM.git" \
+              "+refs/tags/$tag:refs/tags/upstream-$tag"
+          fi
           # Read all published stable releases; tags alone may have no HACS release.
           base="v${tag#v}"
           releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -74,7 +84,7 @@ jobs:
             | sort -V | tail -n 1)
           merge=false
           needed=true
-          if ! git merge-base --is-ancestor "upstream-$tag" HEAD; then
+          if [[ "$GITHUB_EVENT_NAME" != push ]] && ! git merge-base --is-ancestor "upstream-$tag" HEAD; then
             merge=true
           elif [[ -n "$latest" ]]; then
             needed=false
